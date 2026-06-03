@@ -16,7 +16,7 @@ def reconstruct_normal(normal_xy):
     return torch.cat([xy, z], dim=1)
 
 
-def save_image(tensor, path, is_normal=False, is_srgb=True):
+def save_image(tensor, path, is_normal=False):
     """Save a [C, H, W] tensor as an image."""
     img = tensor.detach().cpu().permute(1, 2, 0).numpy()
     if is_normal:

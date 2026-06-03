@@ -4,11 +4,12 @@ import torch.nn.functional as F
 
 
 class MipmapFeatureGrid(nn.Module):
-    def __init__(self, base_resolution, num_mips, feature_dim):
+    def __init__(self, base_resolution, num_mips, feature_dim, filter_mode='trilinear'):
         super().__init__()
         self.base_resolution = base_resolution
         self.num_mips = num_mips
         self.feature_dim = feature_dim
+        self.filter_mode = filter_mode
 
         mips = []
         for i in range(num_mips):
@@ -27,13 +28,16 @@ class MipmapFeatureGrid(nn.Module):
 
         uv_grid = uv * 2 - 1
 
+        # 空间插值模式: trilinear → bilinear, tricubic → bicubic
+        spatial_mode = 'bilinear' if self.filter_mode == 'trilinear' else 'bicubic'
+
         feat0, feat1 = [], []
         for b in range(B):
             m0 = self.mips[int(s0[b].item())]
             m1 = self.mips[int(s1[b].item())]
-            f0 = F.grid_sample(m0, uv_grid[b:b+1], mode='bilinear',
+            f0 = F.grid_sample(m0, uv_grid[b:b+1], mode=spatial_mode,
                                padding_mode='border', align_corners=False)
-            f1 = F.grid_sample(m1, uv_grid[b:b+1], mode='bilinear',
+            f1 = F.grid_sample(m1, uv_grid[b:b+1], mode=spatial_mode,
                                padding_mode='border', align_corners=False)
             feat0.append(f0)
             feat1.append(f1)
@@ -44,10 +48,10 @@ class MipmapFeatureGrid(nn.Module):
 
 
 class NeuralTextureModel(nn.Module):
-    def __init__(self, feature_configs, hidden_dim, output_dim, num_layers=2):
+    def __init__(self, feature_configs, hidden_dim, output_dim, num_layers=2, filter_mode='trilinear'):
         super().__init__()
         self.feature_grids = nn.ModuleList([
-            MipmapFeatureGrid(res, mips, dim)
+            MipmapFeatureGrid(res, mips, dim, filter_mode)
             for res, mips, dim in feature_configs
         ])
         total_input_dim = sum(dim for _, _, dim in feature_configs)
@@ -78,16 +82,18 @@ class NeuralTextureModel(nn.Module):
         return y
 
 
-def make_model(reference_resolution=1024, output_dim=9):
-    feature_configs = [
-        (512, 7, 3),
-        (256, 6, 3),
-        (128, 5, 3),
-        (64, 4, 3),
-    ]
+def make_model(model_params, output_dim=9):
+    """从配置创建 NeuralTextureModel.
+
+    Args:
+        model_params: dict, 由 get_model_params(config) 产生.
+            包含: feature_configs, hidden_dim, num_layers, filter
+        output_dim: MLP 输出维度
+    """
     return NeuralTextureModel(
-        feature_configs=feature_configs,
-        hidden_dim=16,
+        feature_configs=model_params['feature_configs'],
+        hidden_dim=model_params['hidden_dim'],
         output_dim=output_dim,
-        num_layers=2,
+        num_layers=model_params.get('num_layers', 2),
+        filter_mode=model_params.get('filter', 'trilinear'),
     )

@@ -1,16 +1,48 @@
-# Training outputs
-output/
-output_bc6/
-
-# Compiled Python
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
 
-# Large binary files
-*.pth
+# Experiment outputs (do not commit)
+checkpoints/
+output/
+output_bc/
+output_bc1/
+output_bc2/
+output_bc3/
+output_bc4/
+output_bc5/
+output_bc6/
+
+# Logs
+run.log
+*.log
+reflog.txt
+
+# Datasets and reference materials (large, not source)
+dataset/
+reference/
+*.pdf
 *.jpg
-*.png
+*.jpeg
 
-# IDE
-.idea/
+# Per-experiment evaluation TSV (per-material breakdown, not the run log)
+eval_results.tsv
+**/eval_*.tsv
+
+# Run-level results log (commit-level, not tracked per program.md protocol)
+results.tsv
+
+# Inference / debug visualizations
+*.png.tmp
+debug_*.png
+
+# Editor / OS
 .vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

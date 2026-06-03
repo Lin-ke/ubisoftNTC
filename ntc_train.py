@@ -18,8 +18,13 @@ def build_mipmaps(tensor):
     return mips
 
 
-def sample_reference(mips, uv, scale):
-    """Sample reference with bicubic at two closest mips, linearly mix."""
+def sample_reference(mips, uv, scale, filter_mode='bicubic'):
+    """Sample reference with given spatial filter at two closest mips, linearly mix.
+
+    filter_mode: 'bicubic' (default, backward compat) or 'trilinear' (→ bilinear spatial)
+    """
+    spatial_mode = 'bilinear' if filter_mode == 'trilinear' else 'bicubic'
+
     num_mips = len(mips)
     s = torch.clamp(scale, 0, num_mips - 1)
     s0 = s.long()
@@ -31,8 +36,8 @@ def sample_reference(mips, uv, scale):
     for b in range(uv.shape[0]):
         m0 = mips[s0[b].item()].unsqueeze(0)
         m1 = mips[s1[b].item()].unsqueeze(0)
-        r0 = F.grid_sample(m0, uv_grid[b:b+1], mode='bicubic', padding_mode='border', align_corners=False)
-        r1 = F.grid_sample(m1, uv_grid[b:b+1], mode='bicubic', padding_mode='border', align_corners=False)
+        r0 = F.grid_sample(m0, uv_grid[b:b+1], mode=spatial_mode, padding_mode='border', align_corners=False)
+        r1 = F.grid_sample(m1, uv_grid[b:b+1], mode=spatial_mode, padding_mode='border', align_corners=False)
         results.append((1 - lam[b]) * r0 + lam[b] * r1)
     return torch.cat(results, dim=0)
 

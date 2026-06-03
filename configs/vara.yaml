@@ -1,0 +1,28 @@
+# VARA 配置 — 论文 NBTC-CooperativeVectors 变体A
+# BC1 格式, 4张 latent 纹理, ~14x 压缩, 目标 PSNR ~40.9dB
+# T0/T3: 全分辨率, T1/T2: 半分辨率 (T1/T3 有半像素偏移)
+
+bc_format: bc1
+loss: l1
+
+model:
+  filter: trilinear
+  num_layers: 1
+  half_pixel_offsets: [1, 3]  # T1, T3 半像素偏移
+  feature_configs:
+    - [1024, 1, 3]   # T0: 全分辨率
+    - [512, 1, 3]    # T1: 半分辨率 (+0.5px)
+    - [512, 1, 3]    # T2: 半分辨率
+    - [1024, 1, 3]   # T3: 全分辨率 (+0.5px)
+  hidden_dim: 64
+
+optimizer:
+  lr_feat: 1.0e-2
+  lr_mlp: 1.0e-3
+  betas: [0.9, 0.999]
+
+training:
+  total_iterations: 206000
+  batch_res: 512
+  log_interval: 1000
+  output_dir: output_vara

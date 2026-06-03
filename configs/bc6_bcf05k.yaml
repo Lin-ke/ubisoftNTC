@@ -1,0 +1,42 @@
+# BC6 BCf-0.5K 基线配置 (NBTC 单阶段 QAT, yaml-driven)
+# 参考: Real-Time Neural Materials using Block-Compressed Features, 2024
+#       HW Accelerated NBTC with Cooperative Vectors, 2025
+
+bc_format: bc6
+loss: l1
+
+dataset:
+  root: dataset
+  target_res: 256
+
+model:
+  feature_configs:
+    - [512, 8, 3]   # T0
+    - [256, 7, 3]   # T1  (+0.5px)
+    - [128, 6, 3]   # T2
+    - [64,  5, 3]   # T3  (+0.5px)
+  hidden_dim: 16
+  num_layers: 1
+  filter: trilinear
+  half_pixel_offsets: [1, 3]   # T1, T3 半像素偏移 (论文设计)
+
+uc_training:
+  total_iterations: 10000
+  batch_res: 128
+  lr_feat: 5.0e-2
+  lr_mlp: 1.0e-3
+  gamma: 0.9995
+
+bc_training:
+  total_iterations: 10000
+  batch_res: 128
+  lr_feat: 1.0e-2
+  lr_mlp: 1.0e-3
+  betas: [0.9, 0.999]
+  log_interval: 1000
+  output_dir: output_bc6
+
+benchmark:
+  warmup_iters: 5
+  timing_iters: 20
+  mlp_param_bits: 16   # 假设部署 FP16 推理
