@@ -1,6 +1,4 @@
-# BC1 BCf-0.5K 配置 (NBTC 单阶段 QAT)
-# BC1 (DXT1): 2端点, 2-bit索引(4级), RGB565端点
-
+# BC1 baseline config — DXT1: 2端点 5-bit RGB565, 2-bit索引(4级)
 bc_format: bc1
 loss: l1
 
@@ -15,13 +13,25 @@ model:
     - [64, 5, 3]
   hidden_dim: 16
 
-optimizer:
+uc_training:
+  total_iterations: 10000
+  batch_res: 128
+  lr_feat: 5.0e-2
+  lr_mlp: 1.0e-3
+  gamma: 0.9995
+
+bc_training:
+  total_iterations: 10000
+  batch_res: 128
   lr_feat: 1.0e-2
   lr_mlp: 1.0e-3
   betas: [0.9, 0.999]
 
-training:
-  total_iterations: 206000
-  batch_res: 512
-  log_interval: 1000
-  output_dir: output_bc1
+dataset:
+  root: dataset
+  target_res: 256
+
+benchmark:
+  warmup_iters: 5
+  timing_iters: 20
+  mlp_param_bits: 16
