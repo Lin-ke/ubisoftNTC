@@ -13,7 +13,7 @@ R4. 查最近 run.log 有无 crash → 有则走 LOOP (f) crash 处理, 否则�
 
 ## 启动 (仅 master 分支 + 无 checkpoints 时)
 
-1. 读 program.md、task.md、modifiable 文件 (evaluate.py, ntc_bc_model.py, ntc_bc_train.py, ntc_config.py, configs/*.yaml)。
+1. 读 program.md、modifiable 文件 (evaluate.py, ntc_bc_model.py, ntc_bc_train.py, ntc_config.py, configs/*.yaml)。
 2. 读 fixed 文件了解接口 (**绝不修改**)。
 3. 仅 master 时新建 `autoresearch/<日期>` 分支。
 4. 确认 dataset/ 有 40 材质子目录, results.tsv 有 header。
@@ -25,8 +25,9 @@ R4. 查最近 run.log 有无 crash → 有则走 LOOP (f) crash 处理, 否则�
 ## Subagent 协议 — 训练/评测全部委派
 
 用 `task` 工具, subagent_type="worker":
-- **Mode=train_uc**: `python evaluate.py --config <yaml> --train-uc > run.log 2>&1`
-- **Mode=eval**: `python evaluate.py --config <yaml> --ckpt <$CKPT> > run.log 2>&1`
+- **Mode=train_uc**: `python evaluate.py --config <yaml> --train-uc --num-workers 4 > run.log 2>&1`
+- **Mode=eval**: `python evaluate.py --config <yaml> --ckpt <$CKPT> --num-workers 4 > run.log 2>&1`
+- 也可用 `train_start.py` / `train_stop.py` 一键启停（见 program.md）
 
 Worker 解析 run.log 末尾 Aggregate 行, 返回 JSON:
 ```json
@@ -53,7 +54,7 @@ h. 回到 a。
 ## 上下文管理
 
 - **绝不** read run.log / .pth / 完整 dataset。日志全给 subagent。
-- 每 ~10 轮写 notes.md (关键 commit + best drop + 1 句洞察, 已 gitignored)。
+- 每 ~2 轮写 notes.md (关键 commit + best drop + 1 句洞察, notes.md **需 commit**)。
 - 上下文紧张时调 `/compact`, 之后重读 program.md 顶部 + notes.md + results.tsv 末 30 行 + git log -10, 继续 LOOP。
 
 ---

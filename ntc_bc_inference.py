@@ -33,7 +33,8 @@ import os
 import argparse
 
 from ntc_bc_model import make_bc_model, get_bc_format
-from ntc_train import load_brick_material, build_mipmaps
+from dataset import load_material, build_mipmaps
+from ntc_utils import reconstruct_normal, save_image, compute_psnr
 
 # 默认模型配置 (inference 无 config 时)
 _DEFAULT_MODEL_PARAMS = {
@@ -99,71 +100,24 @@ def get_bits_per_block(bc_format_name, feature_dim=3):
 
 
 # ============================================================
-# 工具函数
-# ============================================================
-
-def reconstruct_normal(normal_xy):
-    """从XY分量重建法线的Z分量。
-
-    法线是单位向量，满足 x^2 + y^2 + z^2 = 1。
-    给定已预测的XY分量，通过 z = sqrt(1 - x^2 - y^2) 反推出Z分量。
-    使用torch.clamp避免因浮点误差导致负数开根号。
-
-    Args:
-        normal_xy: 形状为 [B, 2, H, W] 的tensor，包含法线的X和Y分量
-
-    Returns:
-        形状为 [B, 3, H, W] 的tensor，完整的XYZ法线向量
-    """
-    xy = normal_xy
-    z = torch.sqrt(torch.clamp(1.0 - xy[:, 0:1] ** 2 - xy[:, 1:2] ** 2, min=0))
-    return torch.cat([xy, z], dim=1)
-
-
-def save_image(tensor, path, is_normal=False):
-    """将形如 [C, H, W] 的tensor保存为图像文件。
-
-    处理流程：tensor -> numpy数组（HWC格式） -> 值域映射 -> uint8 -> PIL保存。
-    对于法线图，需要将 [-1, 1] 范围映射到 [0, 1]。
-
-    Args:
-        tensor: 形状为 [C, H, W] 的torch tensor，值在 [0, 1] 之间（法线除外）
-        path:   输出图像文件路径
-        is_normal: 是否为法线图，法线值域为 [-1, 1]，需要做归一化映射
-    """
-    img = tensor.detach().cpu().permute(1, 2, 0).numpy()
-    if is_normal:
-        img = (img + 1.0) / 2.0
-    img = np.clip(img, 0, 1)
-    img = (img * 255).astype(np.uint8)
-    if img.shape[2] == 1:
-        img = img[:, :, 0]
-    Image.fromarray(img).save(path)
-
-
-def compute_psnr(pred, ref):
-    """计算 PSNR (dB)。"""
-    mse = F.mse_loss(pred, ref).item()
-    return -10 * np.log10(mse + 1e-8)
-
-
-# ============================================================
 # 推理模式实现
 # ============================================================
 
 @torch.no_grad()
-def infer_from_checkpoint(checkpoint_path, bc_format_name, output_dir, device='cuda'):
+def infer_from_checkpoint(checkpoint_path, bc_format_name, material_dir, target_res, output_dir, device='cuda'):
     """从BC模型checkpoint加载模型，重建所有材质层并保存图像，打印各通道PSNR。
 
     Args:
         checkpoint_path: 模型checkpoint文件路径
         bc_format_name:  BC 格式名称 ('bc1'~'bc5')
+        material_dir:    材质目录路径
+        target_res:      目标分辨率
         output_dir:      输出目录
         device:          'cuda' 或 'cpu'
     """
-    ref = load_brick_material('.', target_res=1024).to(device)
+    ref = load_material(material_dir, target_res=target_res).to(device)
     output_dim = ref.shape[0]
-    h, w = 1024, 1024
+    h, w = ref.shape[1], ref.shape[2]
 
     model = make_bc_model(_DEFAULT_MODEL_PARAMS, output_dim=output_dim,
                           bc_format_name=bc_format_name).to(device)
@@ -227,16 +181,18 @@ def infer_from_checkpoint(checkpoint_path, bc_format_name, output_dir, device='c
 
 
 @torch.no_grad()
-def infer_mip_comparison(checkpoint_path, bc_format_name, output_dir, device='cuda'):
+def infer_mip_comparison(checkpoint_path, bc_format_name, material_dir, target_res, output_dir, device='cuda'):
     """跨mip级别PSNR评估：在不同分辨率下评估模型重建精度。
 
     Args:
         checkpoint_path: 模型checkpoint文件路径
         bc_format_name:  BC 格式名称 ('bc1'~'bc5')
+        material_dir:    材质目录路径
+        target_res:      目标分辨率
         output_dir:      输出目录
         device:          'cuda' 或 'cpu'
     """
-    ref = load_brick_material('.', target_res=1024).to(device)
+    ref = load_material(material_dir, target_res=target_res).to(device)
     output_dim = ref.shape[0]
 
     model = make_bc_model(_DEFAULT_MODEL_PARAMS, output_dim=output_dim,
@@ -338,18 +294,20 @@ def compute_model_size(checkpoint_path, bc_format_name):
 
 
 @torch.no_grad()
-def compare_methods(checkpoint_path, bc_format_name, output_dir, device='cuda'):
+def compare_methods(checkpoint_path, bc_format_name, material_dir, target_res, output_dir, device='cuda'):
     """重建结果与参考的逐像素对比：生成预测图、参考图和误差图。
 
     Args:
         checkpoint_path: 模型checkpoint文件路径
         bc_format_name:  BC 格式名称 ('bc1'~'bc5')
+        material_dir:    材质目录路径
+        target_res:      目标分辨率
         output_dir:      输出目录
         device:          'cuda' 或 'cpu'
     """
-    ref = load_brick_material('.', target_res=1024).to(device)
+    ref = load_material(material_dir, target_res=target_res).to(device)
     output_dim = ref.shape[0]
-    h, w = 1024, 1024
+    h, w = ref.shape[1], ref.shape[2]
 
     model = make_bc_model(_DEFAULT_MODEL_PARAMS, output_dim=output_dim,
                           bc_format_name=bc_format_name).to(device)
@@ -429,6 +387,10 @@ if __name__ == '__main__':
                         help='BC 压缩格式 (default: bc1)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='模型checkpoint文件路径 (默认: output_{bc_format}/best_model.pth)')
+    parser.add_argument('--material-dir', type=str, default='dataset/aerial_beach_02',
+                        help='材质目录路径')
+    parser.add_argument('--target-res', type=int, default=1024,
+                        help='目标分辨率')
     parser.add_argument('--mode', type=str, default='full',
                         choices=['full', 'mips', 'size', 'compare'],
                         help='推理模式：full=完整重建, mips=跨mip级PSNR, size=压缩率对比, compare=逐像素误差')
@@ -448,10 +410,10 @@ if __name__ == '__main__':
         print(f"Please run training first:  python evaluate.py --config configs/{bc_fmt}_bcf05k.yaml --train-uc")
     else:
         if args.mode == 'full':
-            infer_from_checkpoint(checkpoint, bc_fmt, output_dir, device)
+            infer_from_checkpoint(checkpoint, bc_fmt, args.material_dir, args.target_res, output_dir, device)
         elif args.mode == 'mips':
-            infer_mip_comparison(checkpoint, bc_fmt, output_dir, device)
+            infer_mip_comparison(checkpoint, bc_fmt, args.material_dir, args.target_res, output_dir, device)
         elif args.mode == 'size':
             compute_model_size(checkpoint, bc_fmt)
         elif args.mode == 'compare':
-            compare_methods(checkpoint, bc_fmt, output_dir, device)
+            compare_methods(checkpoint, bc_fmt, args.material_dir, args.target_res, output_dir, device)

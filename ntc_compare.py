@@ -17,14 +17,15 @@ BC 格式一键对比工具
 """
 
 import torch
-import torch.nn.functional as F
 import numpy as np
-from PIL import Image
 import os
 import sys
 import argparse
 
 from ntc_bc_model import make_bc_model, get_bc_format
+from ntc_bc_inference import get_bits_per_block
+from dataset import load_material, build_mipmaps
+from ntc_utils import reconstruct_normal, save_image, compute_psnr
 
 _DEFAULT_MODEL_PARAMS = {
     'feature_configs': [
@@ -38,11 +39,6 @@ _DEFAULT_MODEL_PARAMS = {
     'filter': 'trilinear',
     'half_pixel_offsets': [1, 3],
 }
-from ntc_train import load_brick_material, build_mipmaps
-from ntc_bc_inference import (
-    reconstruct_normal, save_image, compute_psnr, get_bits_per_block
-)
-
 
 ALL_FORMATS = ['bc1', 'bc2', 'bc3', 'bc4', 'bc5']
 
@@ -240,6 +236,10 @@ def main():
     parser.add_argument('--formats', nargs='+', default=None,
                         choices=ALL_FORMATS,
                         help='要对比的格式列表 (默认: 自动检测已有 checkpoint)')
+    parser.add_argument('--material-dir', type=str, default='dataset/aerial_beach_02',
+                        help='材质目录路径')
+    parser.add_argument('--target-res', type=int, default=1024,
+                        help='目标分辨率')
     parser.add_argument('--output-dir', type=str, default='output_compare',
                         help='对比结果输出目录 (default: output_compare)')
     parser.add_argument('--no-images', action='store_true',
@@ -278,7 +278,7 @@ def main():
 
     # 加载参考材质（只加载一次）
     print("\nLoading reference material...")
-    ref = load_brick_material('.', target_res=1024).to(device)
+    ref = load_material(args.material_dir, target_res=args.target_res).to(device)
     print(f"Reference shape: {ref.shape}")
 
     # 逐格式推理
