@@ -58,3 +58,11 @@
    - 三角波（triangle wave / sawtooth）作为位置编码，可能替代或补充当前的 UV 坐标输入。
    - 直觉：高频细节可能需要周期性的位置信号来辅助 MLP 学习。
    - 注意点：需在哪个阶段注入（UV 采样前？特征拼接后？）、频率如何选择。
+
+## 2026-06-05 baseline run
+- ckpt 005019 (BC6 UC, but model shape == BC1 yaml: same feat_configs/hidden/layers)
+- BC1 baseline: drop=-2.24 (BC>UC because UC undertrained @10k iters w/ gamma=0.9995)
+- Time: ~480s/material, 20 mats / 2 workers = ~80min wall per run. Plan accordingly.
+- crepe_georgette is huge outlier (BC=40.18 vs UC=28.25 → drop -11.93)
+- Game = maximize psnr_bc since UC fixed (we reuse same ckpt).
+- Next: try MSE loss (PSNR is MSE-derived, should align gradient with metric).
