@@ -5,7 +5,7 @@ BC神经材质推理与可视化
 从训练好的BC神经纹理模型checkpoint加载模型，重建所有材质层（反照率、法线、AO、粗糙度、金属度），
 可视化推理结果，计算各项PSNR指标，以及评估BC压缩后的模型大小。
 
-支持全部6种 BC 格式 (bc1~bc6)，通过 --bc-format 参数切换。
+支持 BC1~BC5 共 5 种格式，通过 --bc-format 参数切换。
 
 支持的推理模式（通过 --mode 参数选择）：
   - full   : 从checkpoint加载模型，重建所有材质层，保存预测图像和参考图像，打印各通道PSNR
@@ -19,11 +19,10 @@ BC神经材质推理与可视化
   - BC3: 2端点×(8+5)-bit + 16索引×3-bit          ≈ 58-64 bits (alpha/color 分通道)
   - BC4: 2端点×8-bit + 16索引×3-bit               = 64 bits
   - BC5: 2端点×8-bit + 16索引×3-bit               = 64 bits
-  - BC6: 4端点×6-bit + 16索引×3-bit + 5-bit分区   = 77 bits
 
 用法：
-  python ntc_bc6_inference.py --bc-format bc1 --mode full
-  python ntc_bc6_inference.py --bc-format bc6 --checkpoint output_bc6/best_model.pth --mode compare
+  python ntc_bc_inference.py --bc-format bc1 --mode full
+  python ntc_bc_inference.py --bc-format bc3 --checkpoint output_bc3/best_model.pth --mode compare
 """
 
 import torch
@@ -59,7 +58,7 @@ def get_bits_per_block(bc_format_name, feature_dim=3):
     """根据 BC 格式名称计算每个 4x4 块每通道的 bits 数。
 
     Args:
-        bc_format_name: BC 格式名称 ('bc1'~'bc6')
+        bc_format_name: BC 格式名称 ('bc1'~'bc5')
         feature_dim:    每块的特征通道数 (用于 BC2/BC3 的 alpha/color 分通道计算)
 
     Returns:
@@ -94,10 +93,6 @@ def get_bits_per_block(bc_format_name, feature_dim=3):
         # 同 BC4
         bits = 2 * 8 + 16 * 3
         desc = "2eps×8-bit + 16idx×3-bit"
-    elif fmt == 'bc6':
-        # 4端点×6-bit + 16索引×3-bit + 5-bit分区 = 77
-        bits = 4 * 6 + 16 * 3 + 5
-        desc = "4eps×6-bit + 16idx×3-bit + 5-bit partition"
     else:
         raise ValueError(f"Unknown BC format: {bc_format_name}")
     return bits, desc
@@ -162,7 +157,7 @@ def infer_from_checkpoint(checkpoint_path, bc_format_name, output_dir, device='c
 
     Args:
         checkpoint_path: 模型checkpoint文件路径
-        bc_format_name:  BC 格式名称 ('bc1'~'bc6')
+        bc_format_name:  BC 格式名称 ('bc1'~'bc5')
         output_dir:      输出目录
         device:          'cuda' 或 'cpu'
     """
@@ -237,7 +232,7 @@ def infer_mip_comparison(checkpoint_path, bc_format_name, output_dir, device='cu
 
     Args:
         checkpoint_path: 模型checkpoint文件路径
-        bc_format_name:  BC 格式名称 ('bc1'~'bc6')
+        bc_format_name:  BC 格式名称 ('bc1'~'bc5')
         output_dir:      输出目录
         device:          'cuda' 或 'cpu'
     """
@@ -281,7 +276,7 @@ def compute_model_size(checkpoint_path, bc_format_name):
 
     Args:
         checkpoint_path: 模型checkpoint文件路径
-        bc_format_name:  BC 格式名称 ('bc1'~'bc6')
+        bc_format_name:  BC 格式名称 ('bc1'~'bc5')
     """
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     state = ckpt['model_state_dict']
@@ -348,7 +343,7 @@ def compare_methods(checkpoint_path, bc_format_name, output_dir, device='cuda'):
 
     Args:
         checkpoint_path: 模型checkpoint文件路径
-        bc_format_name:  BC 格式名称 ('bc1'~'bc6')
+        bc_format_name:  BC 格式名称 ('bc1'~'bc5')
         output_dir:      输出目录
         device:          'cuda' 或 'cpu'
     """
@@ -429,9 +424,9 @@ def compare_methods(checkpoint_path, bc_format_name, output_dir, device='cuda'):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='BC Neural Texture Inference')
-    parser.add_argument('--bc-format', type=str, default='bc6',
-                        choices=['bc1', 'bc2', 'bc3', 'bc4', 'bc5', 'bc6'],
-                        help='BC 压缩格式 (default: bc6)')
+    parser.add_argument('--bc-format', type=str, default='bc1',
+                        choices=['bc1', 'bc2', 'bc3', 'bc4', 'bc5'],
+                        help='BC 压缩格式 (default: bc1)')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='模型checkpoint文件路径 (默认: output_{bc_format}/best_model.pth)')
     parser.add_argument('--mode', type=str, default='full',
@@ -450,7 +445,7 @@ if __name__ == '__main__':
 
     if not os.path.exists(checkpoint):
         print(f"\nCheckpoint not found: {checkpoint}")
-        print(f"Please run training first:  python ntc_bc6_train.py configs/{bc_fmt}_bcf05k.yaml")
+        print(f"Please run training first:  python evaluate.py --config configs/{bc_fmt}_bcf05k.yaml --train-uc")
     else:
         if args.mode == 'full':
             infer_from_checkpoint(checkpoint, bc_fmt, output_dir, device)

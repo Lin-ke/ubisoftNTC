@@ -2,7 +2,7 @@
 
 新 schema (yaml-driven, 单一事实源):
 
-    bc_format: bc6                # bc1..bc6
+    bc_format: bc1                # bc1..bc5
     loss: l1                      # l1 | mse
     loss_config: {}               # 可选: 通道权重等
 
@@ -53,34 +53,24 @@ def load_config(path: str) -> Dict[str, Any]:
 
 
 def __validate(config: Dict[str, Any]):
-    """校验 schema 完整性. 兼容新 (bc_training) / 老 (training+optimizer) 两种."""
-    required = ['bc_format', 'model']
+    required = ['bc_format', 'model', 'bc_training']
     for key in required:
         if key not in config:
             raise ValueError(f"缺少必需配置项: '{key}'")
 
     bc_format = config['bc_format']
-    supported = ('bc1', 'bc2', 'bc3', 'bc4', 'bc5', 'bc6')
+    supported = ('bc1', 'bc2', 'bc3', 'bc4', 'bc5')
     if bc_format not in supported:
         raise ValueError(f"不支持的 BC 格式: '{bc_format}', 支持: {', '.join(supported)}")
 
     model = config['model']
-    if 'feature_configs' not in model:
-        raise ValueError("model 缺少 'feature_configs'")
-    if 'hidden_dim' not in model:
-        raise ValueError("model 缺少 'hidden_dim'")
+    for key in ('feature_configs', 'hidden_dim'):
+        if key not in model:
+            raise ValueError(f"model 缺少 '{key}'")
 
-    if 'bc_training' in config:
-        bct = config['bc_training']
-        for key in ('total_iterations', 'batch_res'):
-            if key not in bct:
-                raise ValueError(f"bc_training 缺少 '{key}'")
-    elif 'training' in config:
-        for key in ('total_iterations', 'batch_res'):
-            if key not in config['training']:
-                raise ValueError(f"training 缺少 '{key}' (legacy schema)")
-    else:
-        raise ValueError("缺少必需配置项: 'bc_training' (推荐) 或 'training' (legacy)")
+    for key in ('total_iterations', 'batch_res'):
+        if key not in config['bc_training']:
+            raise ValueError(f"bc_training 缺少 '{key}'")
 
     if 'uc_training' in config:
         for key in ('total_iterations', 'batch_res'):
@@ -89,7 +79,7 @@ def __validate(config: Dict[str, Any]):
 
     loss_fn = config.get('loss', 'l1')
     if loss_fn not in ('l1', 'mse'):
-        raise ValueError(f"loss 仅支持 'l1' | 'mse', 收到: '{loss_fn}'")
+        raise ValueError(f"loss 仅支持 'l1' | 'mse'")
 
 
 # ---------- 提取扁平参数字典 ----------
@@ -107,9 +97,8 @@ def get_model_params(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def get_uc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
-    """提取 UC 训练超参."""
     if 'uc_training' not in config:
-        raise ValueError("配置缺少 'uc_training' 段, 无法运行 --train-uc")
+        raise ValueError("配置缺少 'uc_training' 段")
     t = config['uc_training']
     return {
         'total_iterations': t['total_iterations'],
@@ -117,38 +106,18 @@ def get_uc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'lr_feat': t.get('lr_feat', 5.0e-2),
         'lr_mlp': t.get('lr_mlp', 1.0e-3),
         'gamma': t.get('gamma', 0.9995),
-        'log_interval': t.get('log_interval', 1000),
     }
 
 
 def get_bc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
-    """提取 BC QAT 训练超参. 兼容老 schema (training + optimizer)."""
-    if 'bc_training' in config:
-        t = config['bc_training']
-        return {
-            'total_iterations': t['total_iterations'],
-            'batch_res': t['batch_res'],
-            'lr_feat': t.get('lr_feat', 1.0e-2),
-            'lr_mlp': t.get('lr_mlp', 1.0e-3),
-            'betas': t.get('betas', [0.9, 0.999]),
-            'log_interval': t.get('log_interval', 1000),
-            'output_dir': t.get('output_dir', 'output_bc'),
-            'loss_fn': config.get('loss', 'l1'),
-            'loss_config': config.get('loss_config', {}),
-        }
-    # legacy fallback
-    t = config.get('training', {})
-    opt = config.get('optimizer', {})
+    t = config['bc_training']
     return {
         'total_iterations': t['total_iterations'],
         'batch_res': t['batch_res'],
-        'lr_feat': opt.get('lr_feat', 1.0e-2),
-        'lr_mlp': opt.get('lr_mlp', 1.0e-3),
-        'betas': opt.get('betas', [0.9, 0.999]),
-        'log_interval': t.get('log_interval', 1000),
-        'output_dir': t.get('output_dir', 'output_bc'),
+        'lr_feat': t.get('lr_feat', 1.0e-2),
+        'lr_mlp': t.get('lr_mlp', 1.0e-3),
+        'betas': t.get('betas', [0.9, 0.999]),
         'loss_fn': config.get('loss', 'l1'),
-        'loss_config': config.get('loss_config', {}),
     }
 
 
@@ -171,26 +140,3 @@ def get_benchmark_params(config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# ---------- 向后兼容 (ntc_bc_train.py / ntc_compare.py 老路径) ----------
-
-def get_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
-    """老接口: 默认走 bc_training. 兼容 'training' / 'optimizer' 老 schema."""
-    if 'bc_training' in config:
-        params = get_bc_training_params(config)
-        params['bc_format'] = config.get('bc_format', 'bc6')
-        return params
-    # legacy
-    t = config.get('training', {})
-    opt = config.get('optimizer', {})
-    return {
-        'total_iterations': t.get('total_iterations', 10000),
-        'batch_res': t.get('batch_res', 128),
-        'log_interval': t.get('log_interval', 1000),
-        'output_dir': t.get('output_dir', 'output_bc'),
-        'lr_feat': opt.get('lr_feat', 1e-2),
-        'lr_mlp': opt.get('lr_mlp', 1e-3),
-        'betas': opt.get('betas', [0.9, 0.999]),
-        'loss_fn': config.get('loss', 'l1'),
-        'loss_config': config.get('loss_config', {}),
-        'bc_format': config.get('bc_format', 'bc6'),
-    }

@@ -20,8 +20,8 @@ $IntervalSec     = 60    # 检查频率
 $LogPath         = Join-Path $PSScriptRoot "watchdog.log"
 
 # Busy 判据 — 任一满足即视为 agent/subagent 还在干活, 不发"继续"
-$GpuUtilBusyPct  = 10    # GPU 利用率 >= 此值 = busy (训练时通常 > 50%)
-$GpuMemBusyMiB   = 3000  # 显存 >= 此值 = busy (排除残留 CUDA context, 一般 1-2GB)
+# 注: 不用 GPU mem 判据 — 桌面/浏览器/IDE 也持续占数 GB 显存, 不可靠。
+$GpuUtilBusyPct  = 15    # GPU 利用率 >= 此值 = busy (训练时通常 > 50%)
 $RunLogIdleMin   = 3     # d:\ntc\run.log 在过去 N 分钟内有更新 = busy
 
 # ====================================================================
@@ -83,7 +83,11 @@ function Send-Continue($sid, $msg) {
 }
 
 function Test-GpuBusy {
-    # 返回 $true 若 GPU 在用 (训练进行中)
+    # 返回 $true 若有 python.exe 在跑且 GPU 利用率不为 0 (训练进行中)。
+    # 没有 python 进程 = 一定不是训练 (排除浏览器/IDE 的 GPU 占用)。
+    $pythonProcs = @(Get-Process python -ErrorAction SilentlyContinue)
+    if ($pythonProcs.Count -eq 0) { return $false }
+
     try {
         $line = & nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader,nounits 2>$null | Select-Object -First 1
         if (-not $line) { return $false }
@@ -91,8 +95,8 @@ function Test-GpuBusy {
         if ($parts.Count -lt 2) { return $false }
         $util = [int]$parts[0]
         $mem  = [int]$parts[1]
-        if ($util -ge $GpuUtilBusyPct -or $mem -ge $GpuMemBusyMiB) {
-            Log ("  GPU busy: util={0}% mem={1}MiB" -f $util, $mem)
+        if ($util -ge $GpuUtilBusyPct) {
+            Log ("  GPU busy: python={0}, util={1}% mem={2}MiB" -f $pythonProcs.Count, $util, $mem)
             return $true
         }
     } catch {

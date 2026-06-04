@@ -2,7 +2,7 @@
 BC 格式一键对比工具
 ===========================
 
-扫描各格式的训练输出目录 (output_bc1/ ~ output_bc6/)，
+扫描各格式的训练输出目录 (output_bc1/ ~ output_bc5/)，
 对所有已训练完成的格式运行推理，生成汇总对比报告。
 
 对比维度：
@@ -12,7 +12,7 @@ BC 格式一键对比工具
 
 用法：
   python ntc_compare.py                     # 对比所有已有 checkpoint 的格式
-  python ntc_compare.py --formats bc1 bc6   # 只对比 BC1 和 BC6
+  python ntc_compare.py --formats bc1 bc3   # 只对比 BC1 和 BC3
   python ntc_compare.py --output-dir my_cmp # 指定输出目录
 """
 
@@ -44,7 +44,7 @@ from ntc_bc_inference import (
 )
 
 
-ALL_FORMATS = ['bc1', 'bc2', 'bc3', 'bc4', 'bc5', 'bc6']
+ALL_FORMATS = ['bc1', 'bc2', 'bc3', 'bc4', 'bc5']
 
 
 @torch.no_grad()
@@ -268,7 +268,7 @@ def main():
         for fmt in candidate_formats:
             print(f"  output_{fmt}/best_model.pth")
         print("\nTrain at least one format first:")
-        print("  python ntc_bc6_train.py configs/bc1_bcf05k.yaml")
+        print("  python evaluate.py --config configs/bc1_bcf05k.yaml --train-uc")
         sys.exit(1)
 
     print(f"\nFound checkpoints for: {', '.join(f.upper() for f in sorted(available))}")

@@ -1,21 +1,3 @@
-"""
-数据集量化评估 (yaml-driven)
-=============================
-全部超参从 yaml 配置读取. CLI 仅 4 个开关:
-    --config <yaml>      实验配置 (必需)
-    --train-uc           训练 UC 基线模型并保存
-    --ckpt <dir>         加载已有 UC 的 checkpoint 目录 (eval 模式必需)
-    --materials <list>   逗号分隔材质名, 默认全部
-
-阶段:
-  1. train-uc : 逐材质训练 UC 模型 → checkpoints/<timestamp>/<name>.pth + config.yaml
-  2. eval     : 加载 UC → 跑 BC QAT → 输出 PSNR_drop / inference_ms / compression_ratio
-
-用法:
-  python evaluate.py --config configs/bc6_baseline.yaml --train-uc
-  python evaluate.py --config configs/bc6_baseline.yaml --ckpt checkpoints/<ts>/
-"""
-
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -45,12 +27,24 @@ def _timestamp():
     return datetime.now().strftime('%Y-%m-%d_%H%M%S')
 
 
+def _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device):
+    """随机取一个 batch_res × batch_res 的 UV crop + 一个 Vaidyanathan LOD."""
+    H = W = batch_res
+    u0 = torch.rand(1, device=device) * (1.0 - W / ref_w)
+    v0 = torch.rand(1, device=device) * (1.0 - H / ref_h)
+    u = torch.linspace(u0.item(), u0.item() + W / ref_w, W, device=device)
+    v = torch.linspace(v0.item(), v0.item() + H / ref_h, H, device=device)
+    ug, vg = torch.meshgrid(u, v, indexing='xy')
+    uv = torch.stack([ug, vg], dim=-1).unsqueeze(0)
+    scale = sample_lod_vaidyanathan(num_mips, device)
+    return uv, scale
+
+
 # ============================================================
 # UC 训练 / 加载
 # ============================================================
 
 def train_and_save_uc(ref_mips, output_dim, model_params, uc_params, device, save_path):
-    """训练无约束模型并保存 state_dict."""
     model = make_model(model_params, output_dim=output_dim).to(device)
     ref_mips = [m.to(device) for m in ref_mips]
     num_mips = len(ref_mips)
@@ -63,18 +57,11 @@ def train_and_save_uc(ref_mips, output_dim, model_params, uc_params, device, sav
     gamma = uc_params['gamma']
     iterations = uc_params['total_iterations']
     batch_res = uc_params['batch_res']
-    filter_mode = model_params.get('filter', 'trilinear')
+    filter_mode = model_params['filter']
 
     for it in range(iterations):
         model.train()
-        H = W = batch_res
-        u0 = torch.rand(1, device=device) * (1.0 - W / ref_w)
-        v0 = torch.rand(1, device=device) * (1.0 - H / ref_h)
-        u = torch.linspace(u0.item(), u0.item() + W / ref_w, W, device=device)
-        v = torch.linspace(v0.item(), v0.item() + H / ref_h, H, device=device)
-        ug, vg = torch.meshgrid(u, v, indexing='xy')
-        uv = torch.stack([ug, vg], dim=-1).unsqueeze(0)
-        scale = sample_lod_vaidyanathan(num_mips, device)
+        uv, scale = _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device)
 
         with torch.no_grad():
             ref = sample_reference(ref_mips, uv, scale, filter_mode)
@@ -104,7 +91,6 @@ def load_uc(save_path, model_params, output_dim, device):
 # ============================================================
 
 def train_bc_model(ref_mips, output_dim, model_params, bc_format_name, bc_params, device):
-    """从随机初始化训练 BC QAT 模型."""
     bc_model = make_bc_model(model_params, output_dim=output_dim,
                              bc_format_name=bc_format_name).to(device)
     ref_mips = [m.to(device) for m in ref_mips]
@@ -124,19 +110,12 @@ def train_bc_model(ref_mips, output_dim, model_params, bc_format_name, bc_params
 
     iterations = bc_params['total_iterations']
     batch_res = bc_params['batch_res']
-    loss_fn = bc_params.get('loss_fn', 'l1')
-    filter_mode = model_params.get('filter', 'trilinear')
+    loss_fn = bc_params['loss_fn']
+    filter_mode = model_params['filter']
 
     for it in range(iterations):
         bc_model.train()
-        H = W = batch_res
-        u0 = torch.rand(1, device=device) * (1.0 - W / ref_w)
-        v0 = torch.rand(1, device=device) * (1.0 - H / ref_h)
-        u = torch.linspace(u0.item(), u0.item() + W / ref_w, W, device=device)
-        v = torch.linspace(v0.item(), v0.item() + H / ref_h, H, device=device)
-        ug, vg = torch.meshgrid(u, v, indexing='xy')
-        uv = torch.stack([ug, vg], dim=-1).unsqueeze(0)
-        scale = sample_lod_vaidyanathan(num_mips, device)
+        uv, scale = _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device)
 
         with torch.no_grad():
             ref = sample_reference(ref_mips, uv, scale, filter_mode)
@@ -155,7 +134,6 @@ def train_bc_model(ref_mips, output_dim, model_params, bc_format_name, bc_params
 # ============================================================
 
 def benchmark_inference_ms(bc_model, ref_h, ref_w, device, warmup_iters=5, timing_iters=20):
-    """单次 forward 时延 (ms), 在 ref_h × ref_w 的全 UV 网格上测."""
     bc_model.eval()
     u = torch.linspace(0.0, 1.0, ref_w, device=device)
     v = torch.linspace(0.0, 1.0, ref_h, device=device)
@@ -167,44 +145,32 @@ def benchmark_inference_ms(bc_model, ref_h, ref_w, device, warmup_iters=5, timin
         for _ in range(warmup_iters):
             _ = bc_model(uv, scale)
 
-    if device == 'cuda' or (isinstance(device, torch.device) and device.type == 'cuda'):
+    if str(device) == 'cuda':
         torch.cuda.synchronize()
 
     t0 = time.perf_counter()
     with torch.no_grad():
         for _ in range(timing_iters):
             _ = bc_model(uv, scale)
-    if device == 'cuda' or (isinstance(device, torch.device) and device.type == 'cuda'):
+    if str(device) == 'cuda':
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
 
-    return (elapsed / timing_iters) * 1000.0  # ms
+    return (elapsed / timing_iters) * 1000.0
 
 
 def compute_bc_bits(bc_model, mlp_param_bits=16):
-    """计算 BC 量化模型的总比特数.
-
-    每个 BCBlockFeature:
-      bits = bh * bw * (num_eps * sum(eps_bits per channel) + 16 * idx_bits + partition_bits)
-      partition_bits = 5 if format use_partitions else 0
-
-    MLP 参数: count * mlp_param_bits.
-    """
     total_bits = 0
     for grid in bc_model.feature_grids:
         for mip in grid.mips:
             fmt = mip.bc_format
             C = mip.feature_dim
-            bh = mip.blocks_h
-            bw = mip.blocks_w
             num_eps = fmt.get_endpoint_count()
-            eps_bits = fmt.get_endpoint_bits(C)
-            sum_eps_bits = sum(eps_bits)
+            sum_eps_bits = sum(fmt.get_endpoint_bits(C))
             idx_bits = fmt.get_index_bits()
-            partition_bits = 5 if fmt.use_partitions() else 0
 
-            block_bits = num_eps * sum_eps_bits + 16 * idx_bits + partition_bits
-            total_bits += bh * bw * block_bits
+            block_bits = num_eps * sum_eps_bits + 16 * idx_bits
+            total_bits += mip.blocks_h * mip.blocks_w * block_bits
 
     mlp_params = sum(p.numel() for p in bc_model.mlp.parameters())
     total_bits += mlp_params * mlp_param_bits
@@ -212,7 +178,6 @@ def compute_bc_bits(bc_model, mlp_param_bits=16):
 
 
 def get_png_bytes(dataset_root, material_name):
-    """读取材质目录下 3 个 PNG 的总字节数."""
     mdir = os.path.join(dataset_root, material_name)
     total = 0
     for fname in os.listdir(mdir):
@@ -447,8 +412,7 @@ def main():
             break
         except Exception as e:
             print(f"\n  ERROR on {name}: {e}")
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
 
     if all_results:
         summarize(all_results, params_label)
