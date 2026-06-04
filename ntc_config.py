@@ -117,6 +117,7 @@ def get_bc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'lr_feat': t.get('lr_feat', 1.0e-2),
         'lr_mlp': t.get('lr_mlp', 1.0e-3),
         'betas': t.get('betas', [0.9, 0.999]),
+        'gamma': t.get('gamma', 1.0),
         'loss_fn': config.get('loss', 'l1'),
     }
 

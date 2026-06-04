@@ -257,6 +257,7 @@ def train_bc_model(ref_mips, output_dim, model_params, bc_format_name, bc_params
     batch_res = bc_params['batch_res']
     loss_fn = bc_params['loss_fn']
     filter_mode = model_params['filter']
+    gamma = bc_params.get('gamma', 1.0)
 
     for it in range(iterations):
         bc_model.train()
@@ -270,6 +271,9 @@ def train_bc_model(ref_mips, output_dim, model_params, bc_format_name, bc_params
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        if gamma < 1.0:
+            for pg in optimizer.param_groups:
+                pg['lr'] *= gamma
 
     return bc_model
 
