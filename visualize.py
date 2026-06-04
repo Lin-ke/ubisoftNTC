@@ -235,7 +235,10 @@ def load_model_for_vis(ckpt_path, model_params, device, bc_format_name=None):
         model = make_model(model_params, output_dim=9)
 
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(state['model_state_dict'])
+    # UC checkpoint 可能直接是 state_dict；BC checkpoint 通常包装在 dict 中
+    if isinstance(state, dict) and 'model_state_dict' in state:
+        state = state['model_state_dict']
+    model.load_state_dict(state)
     model.to(device)
     model.eval()
     return model
@@ -274,6 +277,7 @@ def main():
     if args.material not in ds.material_names:
         raise ValueError(f"Unknown material '{args.material}'. Available: {ds.material_names}")
     material_data = ds.get_by_name(args.material)
+    material_data['name'] = args.material  # 补充名称字段
 
     # 加载模型
     model = load_model_for_vis(args.ckpt, model_params, device, bc_format_name=args.bc_format)
