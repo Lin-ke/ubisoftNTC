@@ -208,7 +208,12 @@ class BCMipmapFeatureGrid(nn.Module):
         # 空间插值模式: trilinear → bilinear, tricubic → bicubic
         spatial_mode = 'bilinear' if self.filter_mode == 'trilinear' else 'bicubic'
 
-        decompressed = [mip() for mip in self.mips]
+        # 仅解压本 batch 实际用到的 mip（s0 ∪ s1），避免每次迭代解压所有 mip。
+        needed = set()
+        for b in range(B):
+            needed.add(int(s0[b].item()))
+            needed.add(int(s1[b].item()))
+        decompressed = {idx: self.mips[idx]() for idx in needed}
 
         feat0, feat1 = [], []
         for b in range(B):

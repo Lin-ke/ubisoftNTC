@@ -339,6 +339,69 @@ def get_png_bytes(dataset_root, material_name):
 # 单材质评估
 # ============================================================
 
+# UC PSNR 缓存：BC 实验里 UC ckpt 只读、psnr_uc 是常量，
+# 没必要每次 eval 都重新加载 UC 模型推理一遍。
+# 训完 UC 时写一次 <ckpt>/uc_psnr.tsv，BC eval 直接读。
+_UC_PSNR_CACHE = {}  # 进程内 RAM cache：{ckpt_dir: {name: psnr}}
+
+
+def _uc_psnr_tsv_path(ckpt_dir):
+    return os.path.join(ckpt_dir, 'uc_psnr.tsv')
+
+
+def _load_uc_psnr_table(ckpt_dir):
+    if ckpt_dir in _UC_PSNR_CACHE:
+        return _UC_PSNR_CACHE[ckpt_dir]
+    path = _uc_psnr_tsv_path(ckpt_dir)
+    table = {}
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split('\t')
+                if len(parts) >= 2:
+                    try:
+                        table[parts[0]] = float(parts[1])
+                    except ValueError:
+                        pass
+    _UC_PSNR_CACHE[ckpt_dir] = table
+    return table
+
+
+def _append_uc_psnr(ckpt_dir, name, psnr):
+    """追加一行到 uc_psnr.tsv 并更新 RAM cache."""
+    table = _load_uc_psnr_table(ckpt_dir)
+    table[name] = psnr
+    path = _uc_psnr_tsv_path(ckpt_dir)
+    write_header = not os.path.exists(path)
+    with open(path, 'a', encoding='utf-8') as f:
+        if write_header:
+            f.write('name\tpsnr_uc\n')
+        f.write(f'{name}\t{psnr:.4f}\n')
+
+
+def get_or_compute_uc_psnr(name, mipmaps, model_params, output_dim, device, ckpt_dir):
+    """优先从缓存读 psnr_uc；没有就加载 UC 模型算一次并写回缓存."""
+    table = _load_uc_psnr_table(ckpt_dir)
+    if name in table:
+        return table[name]
+
+    uc_path = os.path.join(ckpt_dir, f'{name}.pth')
+    if not os.path.exists(uc_path):
+        raise FileNotFoundError(
+            f"UC checkpoint 不存在: {uc_path}\n请先运行: python evaluate.py --config <yaml> --train-uc"
+        )
+    uc_model = load_uc(uc_path, model_params, output_dim, device)
+    mips_gpu = [m.to(device) for m in mipmaps]
+    psnr_uc, _ = evaluate_full(uc_model, mips_gpu, device)
+    del uc_model
+    torch.cuda.empty_cache()
+    _append_uc_psnr(ckpt_dir, name, psnr_uc)
+    return psnr_uc
+
+
 def evaluate_one(name, mipmaps, model_params, bc_format_name, device, ckpt_dir,
                  bc_params, dataset_root, bench_params, vis_dir=None):
     output_dim = mipmaps[0].shape[0]
@@ -347,23 +410,14 @@ def evaluate_one(name, mipmaps, model_params, bc_format_name, device, ckpt_dir,
 
     results = {'name': name, 'channels': output_dim, 'resolution': f'{ref_h}x{ref_w}'}
 
-    # --- UC ---
-    uc_path = os.path.join(ckpt_dir, f'{name}.pth')
-    if not os.path.exists(uc_path):
-        raise FileNotFoundError(
-            f"UC checkpoint 不存在: {uc_path}\n请先运行: python evaluate.py --config <yaml> --train-uc"
-        )
-
-    uc_model = load_uc(uc_path, model_params, output_dim, device)
-    mips_gpu = [m.to(device) for m in mipmaps]
-    psnr_uc, _ = evaluate_full(uc_model, mips_gpu, device)
+    # --- UC PSNR (cached, 与 BC 实验解耦) ---
+    psnr_uc = get_or_compute_uc_psnr(name, mipmaps, model_params, output_dim, device, ckpt_dir)
     results['psnr_unconstrained'] = round(psnr_uc, 2)
-    del uc_model
-    torch.cuda.empty_cache()
 
     # --- BC QAT ---
     bc_model = train_bc_model(mipmaps, output_dim, model_params, bc_format_name,
                               bc_params, device)
+    mips_gpu = [m.to(device) for m in mipmaps]
     psnr_bc, _ = evaluate_full(bc_model, mips_gpu, device)
     results['psnr_bc'] = round(psnr_bc, 2)
     results['psnr_drop'] = round(psnr_uc - psnr_bc, 2)
@@ -478,7 +532,8 @@ def _mp_train_uc_worker(args):
         psnr_uc, _ = evaluate_full(model, mips_gpu, device)
         el = time.time() - t0
         results.append((name, psnr_uc, el))
-        print(f"[{gpu_id}] [{i+1:>2d}/{len(names)}] {name:<30s} {psnr_uc:>7.2f} {el:>5.1f}s")
+        _append_uc_psnr(ckpt_dir, name, psnr_uc)
+        print(f"[{gpu_id}] [{i+1:>2d}/{len(names)}] {name:<30s} {psnr_uc:>7.2f} {el:>5.1f}s", flush=True)
         del model
         torch.cuda.empty_cache()
     return results
@@ -523,11 +578,11 @@ def _mp_eval_worker(args):
             print(f"[{gpu_id}] [{i+1:>2d}/{len(names)}] {r['name']:<30s} "
                   f"{r['psnr_unconstrained']:>7.2f} {r['psnr_bc']:>7.2f} "
                   f"{r['psnr_drop']:>6.2f} {r['inference_ms']:>8.3f} "
-                  f"{r['compression_ratio']:>7.4f} {r['time_total']:>5.1f}s")
+                  f"{r['compression_ratio']:>7.4f} {r['time_total']:>5.1f}s", flush=True)
         except FileNotFoundError as e:
-            print(f"[{gpu_id}] SKIP {name}: {e}")
+            print(f"[{gpu_id}] SKIP {name}: {e}", flush=True)
         except Exception as e:
-            print(f"[{gpu_id}] ERROR on {name}: {e}")
+            print(f"[{gpu_id}] ERROR on {name}: {e}", flush=True)
             import traceback
             traceback.print_exc()
     return all_results
@@ -632,7 +687,8 @@ def main():
                 mips_gpu = [m.to(device) for m in mipmaps]
                 psnr_uc, _ = evaluate_full(model, mips_gpu, device)
                 el = time.time() - t0
-                print(f"[{i+1:>2d}/{len(names)}] {name:<30s} {psnr_uc:>7.2f} {el:>5.1f}s")
+                _append_uc_psnr(ckpt_dir, name, psnr_uc)
+                print(f"[{i+1:>2d}/{len(names)}] {name:<30s} {psnr_uc:>7.2f} {el:>5.1f}s", flush=True)
                 del model
                 torch.cuda.empty_cache()
 
