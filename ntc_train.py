@@ -2,15 +2,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-
-def build_mipmaps(tensor):
-    mips = [tensor]
-    h, w = tensor.shape[1], tensor.shape[2]
-    while min(h, w) > 1:
-        h, w = max(1, h // 2), max(1, w // 2)
-        mip = F.interpolate(mips[-1].unsqueeze(0), size=(h, w), mode='area').squeeze(0)
-        mips.append(mip)
-    return mips
+from dataset import build_mipmaps
 
 
 def sample_reference(mips, uv, scale, filter_mode='bicubic'):

@@ -3,7 +3,7 @@
 
 用法:
     python train_stop.py           # 读取 logs/train.pid 停止主进程
-    python train_stop.py --all     # 强制杀掉所有 evaluate.py 相关进程（兜底）
+    python train_stop.py --all     # 强制杀掉所有 Tool.py 相关进程（兜底）
 """
 import argparse
 import os
@@ -48,13 +48,13 @@ def wait_pid_gone(pid, timeout=10):
 
 
 def find_evaluate_processes():
-    """查找所有名为 evaluate.py 的 Python 进程（兜底用）。"""
+    """查找所有名为 Tool.py 的 Python 进程（兜底用）。"""
     pids = []
     try:
         import psutil
         for p in psutil.process_iter(['pid', 'name', 'cmdline']):
             cmdline = p.info.get('cmdline') or []
-            if any('evaluate.py' in s for s in cmdline):
+            if any('Tool.py' in s for s in cmdline):
                 pids.append(p.info['pid'])
     except ImportError:
         # 没有 psutil，用 tasklist / pgrep 兜底
@@ -64,7 +64,7 @@ def find_evaluate_processes():
                 capture_output=True, text=True
             )
             for line in result.stdout.splitlines():
-                if 'evaluate.py' in line:
+                if 'Tool.py' in line:
                     parts = line.strip().split()
                     if parts:
                         try:
@@ -73,7 +73,7 @@ def find_evaluate_processes():
                             pass
         else:
             result = subprocess.run(
-                ['pgrep', '-f', 'evaluate.py'],
+                ['pgrep', '-f', 'Tool.py'],
                 capture_output=True, text=True
             )
             for line in result.stdout.splitlines():
@@ -86,7 +86,7 @@ def find_evaluate_processes():
 def main():
     parser = argparse.ArgumentParser(description='一键停止 NTC 训练/评估')
     parser.add_argument('--all', action='store_true',
-                        help='强制杀掉所有 evaluate.py 进程（兜底）')
+                        help='强制杀掉所有 Tool.py 进程（兜底）')
     parser.add_argument('--force', action='store_true',
                         help='直接强制杀死，不等待优雅退出')
     args = parser.parse_args()
@@ -116,13 +116,13 @@ def main():
                 print(f'[train_stop] pid={pid} already gone.')
         os.remove(PID_FILE)
 
-    # 2. 兜底：查找并停止所有 evaluate.py 进程
+    # 2. 兜底：查找并停止所有 Tool.py 进程
     if args.all or not stopped:
         pids = find_evaluate_processes()
         for pid in pids:
             if pid == os.getpid():
                 continue
-            print(f'[train_stop] Killing evaluate.py pid={pid} ...')
+            print(f'[train_stop] Killing Tool.py pid={pid} ...')
             if kill_pid(pid, graceful=not args.force):
                 stopped.append(pid)
 

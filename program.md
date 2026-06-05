@@ -4,18 +4,21 @@ Minimize BC quantization PSNR drop across 40 PBR materials, tracking inference t
 
 ## Setup
 
-1. Read fixed files (never modify): `dataset.py`, `ntc_model.py`, `ntc_train.py`, `ntc_inference.py`, `ntc_bc_inference.py`, `ntc_compare.py`.
-2. Read modifiable files: `evaluate.py`, `ntc_bc_model.py`, `ntc_bc_train.py`, `ntc_config.py`, `configs/*.yaml`.
+1. Read fixed files (never modify): `dataset.py`, `ntc_model.py`, `ntc_train.py`, `ntc_bc_inference.py`, `ntc_compare.py`.
+2. Read modifiable files: `Tool.py`, `ntc_bc_model.py`, `ntc_bc_train.py`, `ntc_config.py`, `configs/*.yaml`.
 3. Confirm `dataset/` contains material subdirectories with `*_arm_2k.png`, `*_diff_2k.png`, `*_nor_dx_2k.png`.
 4. `notes.md` is your **freeform notebook**. Read the last 5–10 entries before forming a new hypothesis; append whenever you have an observation, hunch, or dead-end worth remembering. Unlike `results.tsv`, `notes.md` **is committed** — it's cross-session memory.
 
 ## Quick Start (One-Click)
 
-Use `train_start.py` / `train_stop.py` instead of calling `evaluate.py` directly.
+Use `train_start.py` / `train_stop.py` instead of calling `Tool.py` directly.
 
 ```bash
 # UC 训练（自动检测 GPU，每卡 2 worker，日志写到 logs/）
 python train_start.py --mode train-uc
+
+# BC 训练
+python train_start.py --mode train-bc --ckpt checkpoints/<ts>/
 
 # Eval（复用已有 checkpoint）
 python train_start.py --mode eval --ckpt checkpoints/<ts>/ --workers 10
@@ -26,18 +29,21 @@ python train_start.py --mode train-uc --daemon
 # 停止（读 pid 文件，优雅退出）
 python train_stop.py
 
-# 强制杀死所有 evaluate.py 进程
+# 强制杀死所有 Tool.py 进程
 python train_stop.py --all --force
 ```
 
-如需直接调用 `evaluate.py`：
+如需直接调用 `Tool.py`：
 
 ```bash
-# Train UC (4 worker parallel)
-python evaluate.py --config configs/bc1_bcf05k.yaml --train-uc --num-workers 4
+# Train BC (4 worker parallel)
+python Tool.py --config configs/bc1_bcf05k.yaml --train-bc --num-workers 4
 
-# Eval BC (4 worker parallel, reuse same --ckpt)
-python evaluate.py --config configs/bc1_bcf05k.yaml --ckpt checkpoints/<ts>/ --num-workers 4
+# Train UC (optional, for PSNR drop comparison)
+python Tool.py --config configs/bc1_bcf05k.yaml --train-uc --num-workers 4
+
+# Eval (4 worker parallel, reuse same --ckpt)
+python Tool.py --config configs/bc1_bcf05k.yaml --ckpt checkpoints/<ts>/ --num-workers 4
 ```
 
 Model-shape changes require a new UC run: `feature_configs`, `hidden_dim`, `num_layers`.
@@ -45,11 +51,11 @@ Model-shape changes require a new UC run: `feature_configs`, `hidden_dim`, `num_
 ## What you can modify
 
 - **YAML**: `bc_format` (bc1–bc5), `loss`/`loss_config`, `filter`, `half_pixel_offsets`, `hidden_dim`, `num_layers`, `feature_configs`, `lr_feat`, `lr_mlp`, `betas`, `total_iterations`, `batch_res`, `mlp_param_bits`.
-- **Python**: `ntc_bc_model.py`, `ntc_bc_train.py`, `evaluate.py`, `ntc_config.py`.
+- **Python**: `ntc_bc_model.py`, `ntc_bc_train.py`, `Tool.py`, `ntc_config.py`.
 
 ## What you CANNOT do
 
-- Modify fixed files. No new packages (torch/numpy/PIL/pyyaml only). Only report via `evaluate.py`'s `summarize()`.
+- Modify fixed files. No new packages (torch/numpy/PIL/pyyaml only). Only report via `Tool.py`'s `summarize()`.
 
 ## Goal
 
@@ -77,9 +83,10 @@ Model-shape changes require a new UC run: `feature_configs`, `hidden_dim`, `num_
 ## Evaluation Pipeline
 
 ```
-Train UC (once per model-shape) → checkpoints/<ts>/<name>.pth + config.yaml
-Eval BC (repeatable)            → psnr_drop, inference_ms, compression_ratio
-                                  → writes <ckpt>/eval_<config-stem>.tsv
+Train BC (standalone)            → checkpoints/<ts>/bc_<format>/<name>.pth + config.yaml
+Train UC (optional, for drop)    → checkpoints/<ts>/<name>.pth
+Eval (load BC + optional UC)     → psnr_bc, psnr_drop (if UC), inference_ms, compression_ratio
+                                   → writes <ckpt>/eval_<config-stem>.tsv
 ```
 
 ### Metrics
@@ -110,7 +117,7 @@ a1b2c3d  1.67            28.45         1.24               0.0832                
 1. Read `results.tsv` last 20 rows, skim `notes.md` last 5–10 entries → form hypothesis.
 2. Edit yaml (or modifiable .py). One variable at a time.
 3. `git commit -m "<description>"`.
-4. Run: `python evaluate.py --config <yaml> --ckpt <$CKPT> --num-workers 4 > run.log 2>&1`
+4. Run: `python Tool.py --config <yaml> --ckpt <$CKPT> --num-workers 4 > run.log 2>&1`
 5. Parse results. If crash → `tail -50 run.log`, fix (≤3 attempts) or `git reset --hard HEAD~1` + log crash.
 6. If psnr_drop improved and secondary metrics acceptable → keep. Else → `git reset --hard HEAD~1`, log discard.
 7. Append to `results.tsv`. Append a short entry to `notes.md` if anything surprised you. Back to step 1.

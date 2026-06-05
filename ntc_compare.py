@@ -268,7 +268,7 @@ def main():
         for fmt in candidate_formats:
             print(f"  output_{fmt}/best_model.pth")
         print("\nTrain at least one format first:")
-        print("  python evaluate.py --config configs/bc1_bcf05k.yaml --train-uc")
+        print("  python Tool.py --config configs/bc1_bcf05k.yaml --train-uc")
         sys.exit(1)
 
     print(f"\nFound checkpoints for: {', '.join(f.upper() for f in sorted(available))}")

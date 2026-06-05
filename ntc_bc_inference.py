@@ -1,16 +1,18 @@
 """
-BC神经材质推理与可视化
+神经材质推理与可视化
 ===========================
 
-从训练好的BC神经纹理模型checkpoint加载模型，重建所有材质层（反照率、法线、AO、粗糙度、金属度），
+从训练好的神经纹理模型checkpoint加载模型，重建所有材质层（反照率、法线、AO、粗糙度、金属度），
 可视化推理结果，计算各项PSNR指标，以及评估BC压缩后的模型大小。
 
-支持 BC1~BC5 共 5 种格式，通过 --bc-format 参数切换。
+支持两种模型类型（通过 --model-type 参数选择）：
+  - bc : BC压缩模型，支持 BC1~BC5 共 5 种格式，通过 --bc-format 参数切换
+  - uc : 无约束浮点模型
 
 支持的推理模式（通过 --mode 参数选择）：
   - full   : 从checkpoint加载模型，重建所有材质层，保存预测图像和参考图像，打印各通道PSNR
   - mips   : 跨所有mip级别评估PSNR，对比重建结果与参考在各分辨率下的精度
-  - size   : 计算BC压缩后特征网格的大小，与未压缩的fp16/fp32存储对比压缩率
+  - size   : 计算BC压缩后特征网格的大小，与未压缩的fp16/fp32存储对比压缩率（仅BC模式）
   - compare: 重建结果与参考的逐像素对比，生成误差图（*_diff.png），打印各通道PSNR
 
 各格式每 4x4 块每通道的 bits：
@@ -21,7 +23,8 @@ BC神经材质推理与可视化
   - BC5: 2端点×8-bit + 16索引×3-bit               = 64 bits
 
 用法：
-  python ntc_bc_inference.py --bc-format bc1 --mode full
+  python ntc_bc_inference.py --model-type bc --bc-format bc1 --mode full
+  python ntc_bc_inference.py --model-type uc --checkpoint output/best_model.pth --mode full
   python ntc_bc_inference.py --bc-format bc3 --checkpoint output_bc3/best_model.pth --mode compare
 """
 
@@ -32,12 +35,12 @@ from PIL import Image
 import os
 import argparse
 
+from ntc_model import make_model
 from ntc_bc_model import make_bc_model, get_bc_format
 from dataset import load_material, build_mipmaps
 from ntc_utils import reconstruct_normal, save_image, compute_psnr
 
-# 默认模型配置 (inference 无 config 时)
-_DEFAULT_MODEL_PARAMS = {
+_DEFAULT_BC_MODEL_PARAMS = {
     'feature_configs': [
         (512, 8, 3),
         (256, 7, 3),
@@ -49,6 +52,51 @@ _DEFAULT_MODEL_PARAMS = {
     'filter': 'trilinear',
     'half_pixel_offsets': [1, 3],
 }
+
+_DEFAULT_UC_MODEL_PARAMS = {
+    'feature_configs': [
+        (512, 8, 3),
+        (256, 7, 3),
+        (128, 6, 3),
+        (64, 5, 3),
+    ],
+    'hidden_dim': 16,
+    'num_layers': 2,
+    'filter': 'trilinear',
+}
+
+
+# ============================================================
+# 模型加载
+# ============================================================
+
+def _load_model(checkpoint_path, output_dim, device, bc_format_name=None):
+    """加载 UC 或 BC 模型。
+
+    Args:
+        checkpoint_path: 模型checkpoint文件路径
+        output_dim:      输出通道数
+        device:          'cuda' 或 'cpu'
+        bc_format_name:  BC 格式名称，None 表示加载 UC 模型
+
+    Returns:
+        (model, label) 元组
+    """
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    if bc_format_name is not None:
+        model = make_bc_model(_DEFAULT_BC_MODEL_PARAMS, output_dim=output_dim,
+                              bc_format_name=bc_format_name).to(device)
+        state = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
+        model.load_state_dict(state)
+        model.eval()
+        return model, bc_format_name.upper()
+    else:
+        model = make_model(_DEFAULT_UC_MODEL_PARAMS, output_dim=output_dim).to(device)
+        state = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
+        model.load_state_dict(state)
+        model.eval()
+        return model, 'UC'
 
 
 # ============================================================
@@ -119,11 +167,8 @@ def infer_from_checkpoint(checkpoint_path, bc_format_name, material_dir, target_
     output_dim = ref.shape[0]
     h, w = ref.shape[1], ref.shape[2]
 
-    model = make_bc_model(_DEFAULT_MODEL_PARAMS, output_dim=output_dim,
-                          bc_format_name=bc_format_name).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt['model_state_dict'])
-    model.eval()
+    model, model_label = _load_model(checkpoint_path, output_dim, device,
+                                      bc_format_name=bc_format_name)
 
     u = torch.linspace(0, 1, w, device=device)
     v = torch.linspace(0, 1, h, device=device)
@@ -141,14 +186,12 @@ def infer_from_checkpoint(checkpoint_path, bc_format_name, material_dir, target_
     metalness = pred[:, 8:9]
     normal_full = reconstruct_normal(normal_xy)
 
-    # 保存预测图像
     save_image(albedo.squeeze(0), f'{output_dir}/albedo_pred.png')
     save_image(normal_full.squeeze(0), f'{output_dir}/normal_pred.png', is_normal=True)
     save_image(ao.squeeze(0), f'{output_dir}/ao_pred.png')
     save_image(roughness.squeeze(0), f'{output_dir}/roughness_pred.png')
     save_image(metalness.squeeze(0), f'{output_dir}/metalness_pred.png')
 
-    # 保存参考图像
     ref_albedo = ref[0:3].unsqueeze(0)
     ref_normal = ref[3:6].unsqueeze(0)
     ref_ao = ref[6:7].unsqueeze(0)
@@ -161,8 +204,7 @@ def infer_from_checkpoint(checkpoint_path, bc_format_name, material_dir, target_
     save_image(ref_roughness.squeeze(0), f'{output_dir}/roughness_ref.png')
     save_image(ref_metalness.squeeze(0), f'{output_dir}/metalness_ref.png')
 
-    # 打印各通道PSNR
-    print(f"\n[{bc_format_name.upper()}] Inference Results:")
+    print(f"\n[{model_label}] Inference Results:")
     print(f"{'Channel':>12s}  {'PSNR (dB)':>10s}")
     print('-' * 28)
     for name, p, r in [
@@ -195,16 +237,13 @@ def infer_mip_comparison(checkpoint_path, bc_format_name, material_dir, target_r
     ref = load_material(material_dir, target_res=target_res).to(device)
     output_dim = ref.shape[0]
 
-    model = make_bc_model(_DEFAULT_MODEL_PARAMS, output_dim=output_dim,
-                          bc_format_name=bc_format_name).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt['model_state_dict'])
-    model.eval()
+    model, model_label = _load_model(checkpoint_path, output_dim, device,
+                                      bc_format_name=bc_format_name)
 
     ref_mips = build_mipmaps(ref.cpu())
 
     os.makedirs(output_dir, exist_ok=True)
-    print(f"\n[{bc_format_name.upper()}] Mip-level PSNR:")
+    print(f"\n[{model_label}] Mip-level PSNR:")
     print(f"{'Mip':>4s}  {'Res':>8s}  {'PSNR(dB)':>10s}")
     print('-' * 30)
 
@@ -309,11 +348,8 @@ def compare_methods(checkpoint_path, bc_format_name, material_dir, target_res, o
     output_dim = ref.shape[0]
     h, w = ref.shape[1], ref.shape[2]
 
-    model = make_bc_model(_DEFAULT_MODEL_PARAMS, output_dim=output_dim,
-                          bc_format_name=bc_format_name).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt['model_state_dict'])
-    model.eval()
+    model, model_label = _load_model(checkpoint_path, output_dim, device,
+                                      bc_format_name=bc_format_name)
 
     u = torch.linspace(0, 1, w, device=device)
     v = torch.linspace(0, 1, h, device=device)
@@ -337,7 +373,6 @@ def compare_methods(checkpoint_path, bc_format_name, material_dir, target_res, o
     ref_roughness = ref[7:8].unsqueeze(0)
     ref_metalness = ref[8:9].unsqueeze(0)
 
-    # 计算并保存误差图
     for name, pred_img, ref_img in [
         ('albedo', albedo, ref_albedo),
         ('normal', normal_full, ref_normal),
@@ -355,8 +390,7 @@ def compare_methods(checkpoint_path, bc_format_name, material_dir, target_res, o
                    is_normal=(name == 'normal'))
         save_image(diff.squeeze(0), f'{output_dir}/{name}_diff.png')
 
-    # 打印各通道PSNR
-    print(f"\n[{bc_format_name.upper()}] Compare Results:")
+    print(f"\n[{model_label}] Compare Results:")
     print(f"{'Channel':>12s}  {'PSNR (dB)':>10s}")
     print('-' * 28)
 
@@ -381,39 +415,53 @@ def compare_methods(checkpoint_path, bc_format_name, material_dir, target_res, o
 # ============================================================
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='BC Neural Texture Inference')
+    parser = argparse.ArgumentParser(description='Neural Texture Inference (UC / BC)')
+    parser.add_argument('--model-type', type=str, default='bc',
+                        choices=['uc', 'bc'],
+                        help='模型类型: uc=无约束, bc=BC压缩 (default: bc)')
     parser.add_argument('--bc-format', type=str, default='bc1',
                         choices=['bc1', 'bc2', 'bc3', 'bc4', 'bc5'],
-                        help='BC 压缩格式 (default: bc1)')
+                        help='BC 压缩格式 (仅 --model-type bc 时生效, default: bc1)')
     parser.add_argument('--checkpoint', type=str, default=None,
-                        help='模型checkpoint文件路径 (默认: output_{bc_format}/best_model.pth)')
+                        help='模型checkpoint文件路径')
     parser.add_argument('--material-dir', type=str, default='dataset/aerial_beach_02',
                         help='材质目录路径')
     parser.add_argument('--target-res', type=int, default=1024,
                         help='目标分辨率')
     parser.add_argument('--mode', type=str, default='full',
                         choices=['full', 'mips', 'size', 'compare'],
-                        help='推理模式：full=完整重建, mips=跨mip级PSNR, size=压缩率对比, compare=逐像素误差')
+                        help='推理模式：full=完整重建, mips=跨mip级PSNR, size=压缩率对比(仅BC), compare=逐像素误差')
     args = parser.parse_args()
 
-    bc_fmt = args.bc_format
-    output_dir = f'output_{bc_fmt}'
-    checkpoint = args.checkpoint or f'{output_dir}/best_model.pth'
+    is_bc = args.model_type == 'bc'
+    bc_fmt = args.bc_format if is_bc else None
+
+    if is_bc:
+        output_dir = f'output_{bc_fmt}'
+        default_ckpt = f'{output_dir}/best_model.pth'
+    else:
+        output_dir = 'output'
+        default_ckpt = f'{output_dir}/best_model.pth'
+
+    checkpoint = args.checkpoint or default_ckpt
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
-    print(f"BC format: {bc_fmt.upper()}")
+    print(f"Model type: {'BC ' + bc_fmt.upper() if is_bc else 'UC'}")
     print(f"Loading checkpoint: {checkpoint}")
 
     if not os.path.exists(checkpoint):
         print(f"\nCheckpoint not found: {checkpoint}")
-        print(f"Please run training first:  python evaluate.py --config configs/{bc_fmt}_bcf05k.yaml --train-uc")
+        print(f"Please run training first:  python Tool.py --config configs/{args.bc_format}_bcf05k.yaml --train-uc")
     else:
         if args.mode == 'full':
             infer_from_checkpoint(checkpoint, bc_fmt, args.material_dir, args.target_res, output_dir, device)
         elif args.mode == 'mips':
             infer_mip_comparison(checkpoint, bc_fmt, args.material_dir, args.target_res, output_dir, device)
         elif args.mode == 'size':
-            compute_model_size(checkpoint, bc_fmt)
+            if not is_bc:
+                print("Error: --mode size is only available for BC models")
+            else:
+                compute_model_size(checkpoint, bc_fmt)
         elif args.mode == 'compare':
             compare_methods(checkpoint, bc_fmt, args.material_dir, args.target_res, output_dir, device)

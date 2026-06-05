@@ -2,12 +2,12 @@
 """一键启动 NTC 训练 / 评估。
 
 用法:
-    # 启动 UC 训练（自动检测 GPU 数，每个 GPU 跑 2 个 worker）
+    -- 训练全精度
     python train_start.py --mode train-uc
-
-    # 启动 eval（10 worker）
-    python train_start.py --mode eval --ckpt checkpoints/xxx --workers 10
-
+    -- 训练压缩；可恢复
+    python train_start.py --mode train-bc --ckpt checkpoints/xxx
+    -- 评估
+    python train_start.py --mode eval --ckpt checkpoints/xxx
     # 后台运行
     python train_start.py --mode train-uc --daemon
 """
@@ -30,7 +30,7 @@ def detect_workers():
 
 def main():
     parser = argparse.ArgumentParser(description='一键启动 NTC 训练/评估')
-    parser.add_argument('--mode', choices=['train-uc', 'eval'], default='train-uc',
+    parser.add_argument('--mode', choices=['train-uc', 'train-bc', 'eval'], default='train-uc',
                         help='运行模式')
     parser.add_argument('--config', default='configs/bc1_bcf05k.yaml',
                         help='YAML 配置文件路径')
@@ -60,12 +60,16 @@ def main():
     log_file = os.path.join(args.log_dir, f'{args.mode}_{timestamp}.log')
     os.makedirs(args.log_dir, exist_ok=True)
 
-    cmd = [sys.executable, 'evaluate.py',
+    cmd = [sys.executable, 'Tool.py',
            '--config', args.config,
            '--num-workers', str(workers)]
 
     if args.mode == 'train-uc':
         cmd.append('--train-uc')
+    elif args.mode == 'train-bc':
+        cmd.append('--train-bc')
+        if args.ckpt:
+            cmd.extend(['--ckpt', args.ckpt])
     else:
         cmd.extend(['--ckpt', args.ckpt])
 

@@ -59,6 +59,10 @@
    - 直觉：高频细节可能需要周期性的位置信号来辅助 MLP 学习。
    - 注意点：需在哪个阶段注入（UV 采样前？特征拼接后？）、频率如何选择。
 
+5. **独立通道**
+   - 把orm的金属度、粗糙度独立出来，只把roughness放到神经纹理流程中。
+   - input：（12channel，如无更改），output：6 channel （normal * 2 + diff * 3 + ao * 1）
+
 ## 2026-06-05 baseline run
 - ckpt 005019 (BC6 UC, but model shape == BC1 yaml: same feat_configs/hidden/layers)
 - BC1 baseline: drop=-2.24 (BC>UC because UC undertrained @10k iters w/ gamma=0.9995)
