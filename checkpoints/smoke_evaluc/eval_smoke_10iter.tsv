@@ -1,0 +1,2 @@
+name	channels	resolution	psnr_unconstrained	psnr_bc	psnr_drop	inference_ms	bc_bits	png_bits	compression_ratio	time_total
+aerial_beach_02	9	64x64	3.74	4.14	-0.39	5.021	29328	156614280	0.0002	0.4
