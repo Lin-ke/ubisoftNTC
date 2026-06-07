@@ -1,0 +1,43 @@
+bc_format: bc1
+bc_training:
+  batch_res: 128
+  betas:
+  - 0.9
+  - 0.999
+  lr_feat: 0.01
+  lr_mlp: 0.001
+  total_iterations: 20000
+benchmark:
+  mlp_param_bits: 16
+  timing_iters: 20
+  warmup_iters: 5
+dataset:
+  root: dataset
+  target_res: 256
+loss: mse
+model:
+  feature_configs:
+  - - 512
+    - 8
+    - 3
+  - - 256
+    - 7
+    - 3
+  - - 128
+    - 6
+    - 3
+  - - 64
+    - 5
+    - 3
+  filter: trilinear
+  half_pixel_offsets:
+  - 1
+  - 3
+  hidden_dim: 16
+  num_layers: 1
+uc_training:
+  batch_res: 128
+  gamma: 0.9995
+  lr_feat: 0.05
+  lr_mlp: 0.001
+  total_iterations: 20000
