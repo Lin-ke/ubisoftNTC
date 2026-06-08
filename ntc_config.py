@@ -81,6 +81,13 @@ def __validate(config: Dict[str, Any]):
     if loss_fn not in ('l1', 'mse'):
         raise ValueError(f"loss 仅支持 'l1' | 'mse'")
 
+    filt = config['model'].get('filter', 'trilinear')
+    if filt != 'trilinear':
+        raise ValueError(
+            f"model.filter 必须为 'trilinear' (当前: '{filt}'). "
+            f"bicubic/tricubic 不对应 GPU 硬件采样行为, 已禁用."
+        )
+
 
 # ---------- 提取扁平参数字典 ----------
 
@@ -106,6 +113,8 @@ def get_uc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'lr_feat': t.get('lr_feat', 5.0e-2),
         'lr_mlp': t.get('lr_mlp', 1.0e-3),
         'gamma': t.get('gamma', 0.9995),
+        'loss_channels': t.get('loss_channels', None),
+        'max_useful_lod': t.get('max_useful_lod', None),
     }
 
 
@@ -119,6 +128,8 @@ def get_bc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'betas': t.get('betas', [0.9, 0.999]),
         'gamma': t.get('gamma', 1.0),
         'loss_fn': config.get('loss', 'l1'),
+        'loss_channels': t.get('loss_channels', None),
+        'max_useful_lod': t.get('max_useful_lod', None),
     }
 
 
@@ -128,6 +139,7 @@ def get_dataset_params(config: Dict[str, Any]) -> Dict[str, Any]:
     return {
         'root': d.get('root', 'dataset'),
         'target_res': d.get('target_res', 256),
+        'output_channels': d.get('output_channels', 'full'),
     }
 
 

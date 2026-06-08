@@ -28,3 +28,17 @@ def compute_psnr(pred, ref):
     """计算 PSNR (dB)."""
     mse = F.mse_loss(pred, ref).item()
     return -10 * np.log10(mse + 1e-8)
+
+
+def write_done_json(status, ckpt_path, data):
+    """写入训练完成的 JSON 文件."""
+    import json
+    import os
+    
+    data['status'] = status
+    data['ckpt'] = ckpt_path
+    
+    json_path = os.path.join("./.loopit", f'done.json')
+    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+    with open(json_path, 'w') as f:
+        json.dump(data, f, indent=4)

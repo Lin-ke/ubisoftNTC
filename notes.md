@@ -36,37 +36,112 @@
 
 ## 2026-06-04 19:03 待试验方向（用户给定）
 
-1. **MLP 加一层** （注意并行数量可能较低一点）
+1. **MLP 加一层/减一层** （注意并行数量可能较低/高一点）
    - 当前默认 `num_layers=1`（部分配置为 2），尝试加深 MLP 看看 PSNR 收益。
    - 注意点：参数量增长有限（MLP 本身很小），主要影响推理速度和显存占用。
-1.1 纹理少一张
-   - 现在默认是采样4张纹理，12个通道，考虑下8通道金字塔能行吗
+1.1 **特征金字塔尺寸**
+   - 现在默认是采样4张纹理，12个通道，能否用更大尺寸的特征同时减少采样？这样做对显存占用影响多少？
 
-
-2. **MLP 激活函数换 hard-Swish**
+1. **MLP 激活函数换 hard-Swish**
    - 出处：MobileNetV3 (2024) 提出，兼顾效果与推理效率。
    - 当前用的是 ReLU，hard-Swish 在移动端/低精度部署上可能有优势。
    - 注意点：训练时收敛性可能略有不同，需观察 PSNR 和训练稳定性。
 
-3. **用 ASTC 结构编码**
+2. **用 ASTC 结构编码**
    - ASTC (Adaptive Scalable Texture Compression) 是移动端 GPU 原生支持的压缩格式。
-   - 当前实现的是 BC1~BC5，ASTC 支持更多 block size 和通道配置，可能获得更高质量或更高压缩比。
-   - 注意点：ASTC 编码/解码逻辑比 BC 复杂得多，需评估实现成本。
-   - 注意点：ASTC设计block选择相关的问题，需要先Train一个版本，然后用ASTC编码，后续根据此编码进行训练。所以你需要重写一个训练框架。
+   - 注意点：ASTC需要考虑
 
-4. **三角波位置编码**
+3. **三角波位置编码**
    - 三角波（triangle wave / sawtooth）作为位置编码，可能替代或补充当前的 UV 坐标输入。
    - 直觉：高频细节可能需要周期性的位置信号来辅助 MLP 学习。
    - 注意点：需在哪个阶段注入（UV 采样前？特征拼接后？）、频率如何选择。
 
-5. **独立通道**
+4. **独立通道**
    - 把orm的金属度、粗糙度独立出来，只把roughness放到神经纹理流程中。
    - input：（12channel，如无更改），output：6 channel （normal * 2 + diff * 3 + ao * 1）
+  
 
-## 2026-06-05 baseline run
-- ckpt 005019 (BC6 UC, but model shape == BC1 yaml: same feat_configs/hidden/layers)
-- BC1 baseline: drop=-2.24 (BC>UC because UC undertrained @10k iters w/ gamma=0.9995)
-- Time: ~480s/material, 20 mats / 2 workers = ~80min wall per run. Plan accordingly.
-- crepe_georgette is huge outlier (BC=40.18 vs UC=28.25 → drop -11.93)
-- Game = maximize psnr_bc since UC fixed (we reuse same ckpt).
-- Next: try MSE loss (PSNR is MSE-derived, should align gradient with metric).
+5. 探索最佳的参数集合（例如，UC train iters, BC train iters）。UC train我估计可以从psnr变化趋势得到一个较为肯定的答案。
+
+6. 训练时**采样方法**的影响？三线性插值，如果是各向异性滤波呢？
+
+7. RGBA8量化而非BC量化，考察影响
+
+8. 
+
+你可以参考的论文：
+```markdown
+## Ubisoft[1]:
+1. 格式：神经纹理本身经过BC1压缩和QAT；
+2. 参数：
+   1. 4个神经纹理，大小；
+   2. 两层MLP，12->16->16->6
+   3. 网络入参就是4个纹理采样的结果，输出是6（AO*1, Noraml * 2, Diff * 3）。金属度和粗糙度不经过网络。
+
+3. 【实机适用范围】树、桌子
+
+## Intel[4]:
+本身是ubisoft早期工作的一个改进，加了bc1、QAT,主要是coorpertive matrix，据称在网络宽度较大（>32）时能得到巨量提升。
+
+## NVIDIA[2]:
+hardGELU近似GELU；
+
+做了很多模拟量化的操作
+
+参数：两个金字塔
+## AMD[3]:
+一个endpoint网络，一个color网络，预测未压缩颜色 
+
+feature texture：FP16，额外多10%做8bit QAT；
+
+3 个隐藏层，每层 64 neurons，SELU 激活，输出 sigmoid（太大了！）
+
+推理后获得BC结果（加载阶段）
+## 腾讯[5]:
+主要是优化NTC让其能在手机上跑。
+技巧：
+1. 移动端不用位置编码
+2. hard-Swish激活函数，hardSwish(x) = x * saturate(x * (1.0f / 6.0f) + 0.5f)
+3. 没有做QAT，训练完了直接量化成ASTC等等，据称没有差异。
+4. 网络: 两个rgba8,16 bit + 位置编码等等，一共33->16->channels
+
+结果：据称8gen1全屏NTC材质GPU额外耗时约 0.5ms 以内，视觉上没有较大差异
+ 
+
+## 腾讯[6]:
+Compression后应该做QAT，以解决压缩目标（重建参数图）和解压目标（重建原图）不一致的问题（压缩的好不等于用压缩参数复原的好）。但是对于有分区选择的压缩算法（如BC6），分区后相当于原本参数空间的子空间，不一定能复原的好。
+
+
+这篇文章试图选择最优分区，方法比较复杂，主要思路就是对于
+每种partition都记录一个评分，不断更新评分，并选择几个评分高的训练。因此这对于ASTC几千个分区模式的不太现实。
+```
+
+## 2026-06-06 实验1: num_layers 1→2 (BC1, L1)
+- hypothesis: MLP depth 从 1 增加到 2 层（12→16→16→9），增加模型容量，PSNR 应有提升。参考 Ubisoft 论文也是 2 层 MLP。
+- config: bc1_nl2.yaml（除 num_layers=2 外，其余与 bc1_bcf05k 基线一致）
+- plan: Train UC → Train BC QAT → Eval，与 bc1_bcf05k 基线对比 psnr_drop
+- status: 已完成 Train UC + Train BC + Eval ✅
+- results: checkpoints/2026-06-06_183449/eval_bc1_nl2.tsv
+- summary:
+  - psnr_bc avg: 30.69 dB
+  - psnr_drop avg: -0.49 dB (negative = BC > UC) ← 异常，8/20材质BC反而更好
+  - inference_ms avg: 7.57 ms
+  - compression_ratio avg: ~0.0057 (约175×压缩)
+  - 8/20 drop<0 (BC更好), 12/20 drop>0 (UC更好)
+  - Best: crepe_georgette drop=-7.67, Worst: patterned_brick_floor drop=1.74
+- observed: QAT训练后，有8个材质的BC PSNR反而高于UC PSNR（drop为负）。这在1层MLP基线（bc1_bcf05k）中也有类似现象吗？需要对比确认。
+- explain: 可能原因：(1) BC QAT从UC权重出发继续训练，在量化空间中找到了更好的局部最优；(2) UC训练10000 iter可能不完全收敛，BC再训10000 iter总迭代数多了一倍；(3) 2层MLP比1层容量大，QAT的效果更明显
+- next: 与 bc1_bcf05k（num_layers=1）基线对比，看负drop是否是2层独有现象。如果1层也有负drop，说明是QAT普遍特性而非深度带来的。
+
+## 2026-06-08 01:24 BC1 + MSE 基线实验 + train_start.py 配置修复
+
+### train_start.py 配置自动检测修复
+- problem: `train_start.py --mode train-bc --ckpt <ckpt>` 时，`--config` 硬编码默认为 `configs/bc1_bcf05k.yaml`（L1），导致 UC=MSE + BC=L1 混搭
+- fix: `train_start.py:57-67` — 当 `--mode train-bc/eval/eval-uc` 且 `--ckpt` 提供时，检查 ckpt 目录下的 `config.yaml`，若存在且用户未显式指定 `--config`，自动替换为 ckpt 配置
+- 效果: BC 训练自动继承 UC 训练的 loss / 模型参数 / BC 训练参数
+
+### BC1 + MSE 基线实验
+- config: bc1_mse.yaml (loss=mse, num_layers=1, hidden_dim=16, 4×feature grid)
+- plan: 与 bc1_bcf05k（L1基线）对比，考察 MSE loss 对 PSNR 的影响
+- status: UC ✅ → BC 训练中 (18/20, ckpt=2026-06-08_010508)
+- hypothesis: MSE 直接优化 PSNR 相关目标，可能比 L1 得到更高 PSNR

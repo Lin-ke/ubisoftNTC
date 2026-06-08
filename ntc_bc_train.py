@@ -2,18 +2,25 @@ import torch
 import math
 
 
-def sample_lod_vaidyanathan(num_mips, device):
-    """Vaidyanathan 2023 风格的 LOD 采样.
+def sample_lod_vaidyanathan(num_mips, device, max_useful_lod=None):
+    """LOD 采样: 整数部分 ~ 指数 (∝ 4^(-k) 面积权重), 小数部分 ~ U[0,1).
 
-    95% 指数分布 (按 mip 面积比例): LOD = floor(-log4(X)), X ~ U(0,1)
-    5%  均匀分布 (防止低分辨率 mip 欠采样).
+    Args:
+        num_mips: mip 总数.
+        device: 张量设备.
+        max_useful_lod: 训练采样的最高整数 LOD (含). None 表示 num_mips - 2.
+            高于此 LOD 的 mip (例如 1x1, 2x2) 不参与训练, 把样本预算让给低 LOD.
+            注意上限被进一步 clamp 到 num_mips - 2, 以保证 s0+1 仍是合法 mip.
 
-    返回连续 scale，模拟 GPU 硬件 trilinear 采样.
+    Returns:
+        scale: shape [1] float, ∈ [0, max_int + 1), 可直接用于两 mip 线性混合.
     """
-    if torch.rand(1, device=device) < 0.05:
-        lod = torch.randint(0, num_mips, (1,), device=device).float()
-    else:
-        X = torch.rand(1, device=device)
-        lod = (-torch.log(X) / math.log(4)).floor().clamp(0, num_mips - 1)
-    lod = lod + torch.rand(1, device=device) * 0.999
-    return lod.clamp(0, num_mips - 1)
+    max_int = num_mips - 2
+    if max_useful_lod is not None:
+        max_int = min(max_int, int(max_useful_lod))
+    max_int = max(max_int, 0)
+
+    X = torch.rand(1, device=device)
+    lod_int = (-torch.log(X) / math.log(4)).floor().long().clamp(0, max_int)
+    lam = torch.rand(1, device=device)
+    return lod_int.float() + lam

@@ -36,8 +36,8 @@ def build_mipmaps(tensor):
     return mips
 
 
-def load_material(material_dir, target_res=1024):
-    """从材质目录加载并组装 9 通道参考张量。
+def load_material(material_dir, target_res=1024, output_channels='full'):
+    """从材质目录加载并组装参考张量。
 
     查找文件:
       - *_arm_2k.png   (AO / Roughness / Metalness)
@@ -45,11 +45,13 @@ def load_material(material_dir, target_res=1024):
       - *_nor_dx_2k.png (Normal, DirectX)
 
     Args:
-        material_dir: 材质子目录路径, 如 d:/ntc/dataset/concrete_wall_006/
-        target_res:   目标分辨率 (正方形), 默认 1024
+        material_dir:      材质子目录路径, 如 d:/ntc/dataset/concrete_wall_006/
+        target_res:        目标分辨率 (正方形), 默认 1024
+        output_channels:   'full' → 9ch (albedo+normal+ao+roughness+metalness)
+                           'compact' → 6ch (albedo+normal_xy+ao)
 
     Returns:
-        ref_tensor: [9, H, W] float32 张量
+        ref_tensor: [C, H, W] float32 张量
     """
     pngs = [f for f in os.listdir(material_dir) if f.endswith('.png')]
 
@@ -81,8 +83,11 @@ def load_material(material_dir, target_res=1024):
     roughness = arm[..., 1:2]  # G → Roughness
     metalness = arm[..., 2:3]  # B → Metalness
 
-    # 拼接: albedo(3) + normal(3) + ao(1) + roughness(1) + metalness(1) = 9
-    reference = np.concatenate([albedo, normal, ao, roughness, metalness], axis=-1)
+    if output_channels == 'compact':
+        normal_xy = normal[..., 0:2]   # 只取 X, Y
+        reference = np.concatenate([albedo, normal_xy, ao], axis=-1)  # 3+2+1=6
+    else:
+        reference = np.concatenate([albedo, normal, ao, roughness, metalness], axis=-1)  # 3+3+1+1+1=9
 
     ref_tensor = torch.from_numpy(reference).permute(2, 0, 1).float()
 
@@ -115,9 +120,10 @@ class MaterialDataset(Dataset):
         preload:    是否在 __init__ 时预加载全部材质 (默认 True)
     """
 
-    def __init__(self, root_dir, target_res=1024, preload=True):
+    def __init__(self, root_dir, target_res=1024, preload=True, output_channels='full'):
         self.root_dir = root_dir
         self.target_res = target_res
+        self.output_channels = output_channels
 
         # 扫描材质子目录 (每个含有 .png 文件的目录)
         self.materials = []
@@ -139,7 +145,7 @@ class MaterialDataset(Dataset):
     def _load_one(self, name):
         """加载单个材质并构建 mipmap。"""
         dpath = os.path.join(self.root_dir, name)
-        ref = load_material(dpath, self.target_res)
+        ref = load_material(dpath, self.target_res, self.output_channels)
         mips = build_mipmaps(ref)
         self._data[name] = {'ref_tensor': ref, 'mipmaps': mips}
 

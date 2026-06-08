@@ -15,6 +15,7 @@ from ntc_model import make_model
 from ntc_bc_model import make_bc_model
 from ntc_train import sample_reference, evaluate_full
 from ntc_bc_train import sample_lod_vaidyanathan
+from ntc_utils import write_done_json
 from ntc_config import (
     load_config,
     get_model_params,
@@ -100,6 +101,11 @@ _CHANNEL_SPECS = {
     },
 }
 _CHANNEL_ORDER = ['Albedo', 'Normal', 'AO', 'Roughness', 'Metalness']
+_COMPACT_CHANNEL_SPECS = {
+    'Albedo': {'pred': (0, 3), 'ref': (0, 3), 'color': (0.8, 0.2, 0.2)},
+    'Normal': {'pred': (3, 5), 'ref': (3, 5), 'color': (0.2, 0.6, 0.8), 'normal': True},
+    'AO':     {'pred': (5, 6), 'ref': (5, 6), 'color': (0.6, 0.6, 0.6)},
+}
 _CHANNEL_ALIASES = {
     'albedo': 'Albedo', 'basecolor': 'Albedo', 'base_color': 'Albedo',
     'normal': 'Normal', 'normal_xy': 'Normal', 'normalxy': 'Normal',
@@ -127,19 +133,29 @@ def _normalize_channel_names(channels):
     return names
 
 
+def _get_specs(ref_dim):
+    return _COMPACT_CHANNEL_SPECS if ref_dim == 6 else _CHANNEL_SPECS
+
+
 def _default_inference_channels(output_dim, ref_dim=9):
     names = []
+    specs = _get_specs(ref_dim)
     for name in _CHANNEL_ORDER:
-        spec = _CHANNEL_SPECS[name]
+        if name not in specs:
+            continue
+        spec = specs[name]
         if output_dim >= spec['pred'][1] and ref_dim >= spec['ref'][1]:
             names.append(name)
     return names
 
 
-def _channel_indices(names):
+def _channel_indices(names, ref_dim=9):
     idx = []
+    specs = _get_specs(ref_dim)
     for name in names:
-        lo, hi = _CHANNEL_SPECS[name]['pred']
+        if name not in specs:
+            continue
+        lo, hi = specs[name]['pred']
         idx.extend(range(lo, hi))
     return idx
 
@@ -149,7 +165,7 @@ def _model_set_inference_channels(self, channels=None, ref_dim=9):
     if names is None:
         names = _default_inference_channels(getattr(self, 'output_dim', 9), ref_dim=ref_dim)
     self.inference_channels = names
-    self.inference_channel_indices = _channel_indices(names)
+    self.inference_channel_indices = _channel_indices(names, ref_dim=ref_dim)
     return names
 
 
@@ -238,7 +254,7 @@ def visualize_comparison(model, material_data, device, output_path, scale=0.0):
             channels = _default_inference_channels(pred.shape[1], ref_tensor.shape[0])
 
     def _pred_ref_for(label):
-        spec = _CHANNEL_SPECS[label]
+        spec = _get_specs(ref_tensor.shape[0])[label]
         plo, phi = spec['pred']
         rlo, rhi = spec['ref']
         pred_ch = pred[0, plo:phi]
@@ -248,6 +264,7 @@ def visualize_comparison(model, material_data, device, output_path, scale=0.0):
         return pred_ch, ref_tensor[rlo:rhi]
 
     rows = []
+    specs = _get_specs(ref_tensor.shape[0])
     for label in channels:
         pred_ch, ref_ch = _pred_ref_for(label)
         psnr = _vis_psnr(pred_ch.unsqueeze(0), ref_ch.unsqueeze(0))
@@ -261,7 +278,7 @@ def visualize_comparison(model, material_data, device, output_path, scale=0.0):
         labeled = []
         for idx, (p, t) in enumerate(zip(panels, titles)):
             p = _add_label(p, t, psnr if idx == 0 else None, font=font)
-            p = _make_border(p, _CHANNEL_SPECS[label]['color'], thickness=2)
+            p = _make_border(p, specs[label]['color'], thickness=2)
             labeled.append(p)
 
         min_h = min(p.shape[0] for p in labeled)
@@ -298,7 +315,7 @@ def visualize_comparison(model, material_data, device, output_path, scale=0.0):
 # UC 训练 / 加载
 # ============================================================
 
-def _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device):
+def _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device, max_useful_lod=None):
     """随机取一个 batch_res × batch_res 的 UV crop + 一个 Vaidyanathan LOD."""
     H = W = batch_res
     u0 = torch.rand(1, device=device) * (1.0 - W / ref_w)
@@ -307,7 +324,7 @@ def _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device):
     v = torch.linspace(v0.item(), v0.item() + H / ref_h, H, device=device)
     ug, vg = torch.meshgrid(u, v, indexing='xy')
     uv = torch.stack([ug, vg], dim=-1).unsqueeze(0)
-    scale = sample_lod_vaidyanathan(num_mips, device)
+    scale = sample_lod_vaidyanathan(num_mips, device, max_useful_lod=max_useful_lod)
     return uv, scale
 
 
@@ -325,14 +342,19 @@ def train_and_save_uc(ref_mips, output_dim, model_params, uc_params, device, sav
     iterations = uc_params['total_iterations']
     batch_res = uc_params['batch_res']
     filter_mode = model_params['filter']
+    loss_channels = uc_params.get('loss_channels', None)
+    max_useful_lod = uc_params.get('max_useful_lod', None)
 
     for it in range(iterations):
         model.train()
-        uv, scale = _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device)
+        uv, scale = _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device, max_useful_lod)
 
         with torch.no_grad():
             ref = sample_reference(ref_mips, uv, scale, filter_mode)
         pred = model(uv, scale)
+        if loss_channels is not None:
+            pred = pred[:, loss_channels, :, :]
+            ref = ref[:, loss_channels, :, :]
         loss = F.mse_loss(pred, ref)
 
         optimizer.zero_grad()
@@ -402,14 +424,19 @@ def train_bc_model(ref_mips, output_dim, model_params, bc_format_name, bc_params
     loss_fn = bc_params['loss_fn']
     filter_mode = model_params['filter']
     gamma = bc_params.get('gamma', 1.0)
+    loss_channels = bc_params.get('loss_channels', None)
+    max_useful_lod = bc_params.get('max_useful_lod', None)
 
     for it in range(iterations):
         bc_model.train()
-        uv, scale = _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device)
+        uv, scale = _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device, max_useful_lod)
 
         with torch.no_grad():
             ref = sample_reference(ref_mips, uv, scale, filter_mode)
         pred = bc_model(uv, scale)
+        if loss_channels is not None:
+            pred = pred[:, loss_channels, :, :]
+            ref = ref[:, loss_channels, :, :]
         loss = F.l1_loss(pred, ref) if loss_fn == 'l1' else F.mse_loss(pred, ref)
 
         optimizer.zero_grad()
@@ -450,6 +477,45 @@ def benchmark_inference_ms(bc_model, ref_h, ref_w, device, warmup_iters=5, timin
     elapsed = time.perf_counter() - t0
 
     return (elapsed / timing_iters) * 1000.0
+
+
+@torch.no_grad()
+def _evaluate_full_loss(model, ref_mips, device, loss_fn='mse', max_res=256):
+    losses = []
+    model.eval()
+
+    for mip_i, ref_mip in enumerate(ref_mips):
+        ref_mip = ref_mip.to(device)
+        h, w = ref_mip.shape[1], ref_mip.shape[2]
+
+        if h <= max_res and w <= max_res:
+            u = torch.linspace(0, 1, w, device=device)
+            v = torch.linspace(0, 1, h, device=device)
+            uv = torch.stack(torch.meshgrid(u, v, indexing='xy'), dim=-1).unsqueeze(0)
+            scale = torch.tensor([float(mip_i)], device=device)
+            pred = model(uv, scale)
+            loss = F.l1_loss(pred, ref_mip.unsqueeze(0)) if loss_fn == 'l1' else F.mse_loss(pred, ref_mip.unsqueeze(0))
+        else:
+            loss_total = 0.0
+            count = 0
+            for ty in range(0, h, max_res):
+                th = min(max_res, h - ty)
+                for tx in range(0, w, max_res):
+                    tw = min(max_res, w - tx)
+                    u = torch.linspace(tx / w, (tx + tw) / w, tw, device=device)
+                    v = torch.linspace(ty / h, (ty + th) / h, th, device=device)
+                    uv = torch.stack(torch.meshgrid(u, v, indexing='xy'), dim=-1).unsqueeze(0)
+                    scale = torch.tensor([float(mip_i)], device=device)
+                    pred = model(uv, scale)
+                    ref_tile = ref_mip[:, ty:ty + th, tx:tx + tw].unsqueeze(0)
+                    tile_loss = F.l1_loss(pred, ref_tile) if loss_fn == 'l1' else F.mse_loss(pred, ref_tile)
+                    loss_total += tile_loss.item() * th * tw
+                    count += th * tw
+            loss = loss_total / count
+        losses.append(loss.item() if hasattr(loss, 'item') else loss)
+
+    model.train()
+    return sum(losses) / len(losses)
 
 
 def compute_bc_bits(bc_model, mlp_param_bits=16):
@@ -532,6 +598,35 @@ def get_or_compute_uc_psnr(name, mipmaps, model_params, output_dim, device, ckpt
     return psnr_uc
 
 
+def evaluate_uc_one(name, mipmaps, model_params, device, ckpt_dir):
+    output_dim = mipmaps[0].shape[0]
+    ref_h, ref_w = mipmaps[0].shape[1], mipmaps[0].shape[2]
+    t0 = time.time()
+
+    uc_path = os.path.join(ckpt_dir, f'{name}.pth')
+    if not os.path.exists(uc_path):
+        raise FileNotFoundError(
+            f"UC checkpoint not found: {uc_path}\n"
+            f"Please run: python Tool.py --config <yaml> --train-uc --ckpt {ckpt_dir}"
+        )
+
+    uc_model = load_uc(uc_path, model_params, output_dim, device)
+    mips_gpu = [m.to(device) for m in mipmaps]
+    psnr_uc, eval_loss = evaluate_full(uc_model, mips_gpu, device)
+    _append_uc_psnr(ckpt_dir, name, psnr_uc)
+    del uc_model
+    torch.cuda.empty_cache()
+
+    return {
+        'name': name,
+        'channels': output_dim,
+        'resolution': f'{ref_h}x{ref_w}',
+        'psnr_ori': round(psnr_uc, 2),
+        'eval_loss': round(eval_loss, 8),
+        'time_total': round(time.time() - t0, 1),
+    }
+
+
 def evaluate_one(name, mipmaps, model_params, bc_format_name, device, ckpt_dir,
                  dataset_root, bench_params, vis_dir=None):
     output_dim = mipmaps[0].shape[0]
@@ -540,9 +635,10 @@ def evaluate_one(name, mipmaps, model_params, bc_format_name, device, ckpt_dir,
 
     results = {'name': name, 'channels': output_dim, 'resolution': f'{ref_h}x{ref_w}'}
 
+    # 原图质量参考：加载 UC（全精度）模型，计算其对原图的 PSNR
     psnr_uc = get_or_compute_uc_psnr(name, mipmaps, model_params, output_dim, device, ckpt_dir)
     if psnr_uc is not None:
-        results['psnr_unconstrained'] = round(psnr_uc, 2)
+        results['psnr_ori'] = round(psnr_uc, 2)
 
     bc_path = _bc_ckpt_path(ckpt_dir, bc_format_name, name)
     if not os.path.exists(bc_path):
@@ -555,6 +651,7 @@ def evaluate_one(name, mipmaps, model_params, bc_format_name, device, ckpt_dir,
     mips_gpu = [m.to(device) for m in mipmaps]
     psnr_bc, _ = evaluate_full(bc_model, mips_gpu, device)
     results['psnr_bc'] = round(psnr_bc, 2)
+    # 原图 → BC 的质量 drop
     if psnr_uc is not None:
         results['psnr_drop'] = round(psnr_uc - psnr_bc, 2)
 
@@ -596,18 +693,27 @@ def evaluate_one(name, mipmaps, model_params, bc_format_name, device, ckpt_dir,
 # ============================================================
 
 def print_header():
-    hdr = (f"{'Material':<30s} {'BC(dB)':>7s} {'UC(dB)':>7s} {'Drop':>6s} "
+    hdr = (f"{'Material':<30s} {'BC(dB)':>7s} {'Drop':>6s} "
            f"{'Inf(ms)':>8s} {'CR':>7s} {'Time':>6s}")
     print(hdr)
-    print('-' * 80)
+    print('-' * 78)
+
+
+def print_uc_header():
+    print(f"{'Material':<30s} {'UC(dB)':>7s} {'Loss':>12s} {'Time':>6s}")
+    print('-' * 62)
 
 
 def print_result(r):
-    uc_str = f"{r['psnr_unconstrained']:>7.2f}" if 'psnr_unconstrained' in r else f"{'N/A':>7s}"
     drop_str = f"{r['psnr_drop']:>6.2f}" if 'psnr_drop' in r else f"{'N/A':>6s}"
-    print(f"{r['name']:<30s} {r['psnr_bc']:>7.2f} {uc_str} {drop_str} "
+    print(f"{r['name']:<30s} {r['psnr_bc']:>7.2f} {drop_str} "
           f"{r['inference_ms']:>8.3f} {r['compression_ratio']:>7.4f} "
           f"{r['time_total']:>5.1f}s")
+
+
+def print_uc_result(r):
+    print(f"{r['name']:<30s} {r['psnr_ori']:>7.2f} "
+          f"{r['eval_loss']:>12.8f} {r['time_total']:>5.1f}s")
 
 
 def summarize(all_results, params_label):
@@ -617,10 +723,11 @@ def summarize(all_results, params_label):
     print(f"{'Metric':>28s} {'Mean':>10s} {'Min':>10s} {'Max':>10s} {'Std':>10s}")
     print('-' * 80)
 
-    has_uc = any('psnr_unconstrained' in r for r in all_results)
-    metrics = ['psnr_bc']
-    if has_uc:
-        metrics = ['psnr_unconstrained', 'psnr_bc', 'psnr_drop'] + metrics
+    has_ori = any('psnr_ori' in r for r in all_results)
+    if has_ori:
+        metrics = ['psnr_ori', 'psnr_bc', 'psnr_drop']
+    else:
+        metrics = ['psnr_bc']
     metrics += ['inference_ms', 'compression_ratio']
 
     for k in metrics:
@@ -638,7 +745,7 @@ def summarize(all_results, params_label):
 def save_tsv(all_results, ckpt_dir, suffix):
     path = os.path.join(ckpt_dir, f'eval_{suffix}.tsv')
     cols = ['name', 'channels', 'resolution',
-            'psnr_unconstrained', 'psnr_bc', 'psnr_drop',
+            'psnr_ori', 'psnr_bc', 'psnr_drop',
             'inference_ms', 'bc_bits', 'png_bits', 'compression_ratio',
             'time_total']
     with open(path, 'w', encoding='utf-8') as f:
@@ -648,86 +755,293 @@ def save_tsv(all_results, ckpt_dir, suffix):
     print(f"Saved to {path}")
 
 
+def save_uc_tsv(all_results, ckpt_dir, suffix):
+    path = os.path.join(ckpt_dir, f'eval_uc_{suffix}.tsv')
+    cols = ['name', 'channels', 'resolution', 'psnr_ori', 'eval_loss', 'time_total']
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\t'.join(cols) + '\n')
+        for r in all_results:
+            f.write('\t'.join(str(r.get(c, '')) for c in cols) + '\n')
+    print(f"Saved to {path}")
+
+
+def _summarize_train_results(results):
+    times = [r['time_total'] for r in results]
+    losses = [r['train_loss'] for r in results if r.get('train_loss') is not None]
+    data = {
+        'time_total': round(sum(times), 3) if times else 0.0,
+        'time_avg': round(float(np.mean(times)), 3) if times else 0.0,
+        'num_materials': len(results),
+    }
+    if losses:
+        data['train_loss'] = round(float(np.mean(losses)), 8)
+        data['train_loss_min'] = round(float(np.min(losses)), 8)
+        data['train_loss_max'] = round(float(np.max(losses)), 8)
+    return data
+
+
+def _summarize_eval_results(all_results):
+    data = {'num_materials': len(all_results)}
+    for k in ('psnr_ori', 'psnr_bc', 'psnr_drop', 'inference_ms', 'compression_ratio', 'eval_loss'):
+        vals = [r[k] for r in all_results if k in r]
+        if vals:
+            data[k] = round(float(np.mean(vals)), 6)
+            data[f'{k}_min'] = round(float(np.min(vals)), 6)
+            data[f'{k}_max'] = round(float(np.max(vals)), 6)
+    times = [r['time_total'] for r in all_results if 'time_total' in r]
+    if times:
+        data['time_total'] = round(float(np.sum(times)), 3)
+        data['time_avg'] = round(float(np.mean(times)), 3)
+    return data
+
+
+def summarize_uc(all_results, params_label):
+    print(f"\n{'='*80}")
+    print(f"UC Eval aggregate over {len(all_results)} materials  "
+          f"({all_results[0].get('resolution','?')}, {params_label}):")
+    print(f"{'Metric':>28s} {'Mean':>10s} {'Min':>10s} {'Max':>10s} {'Std':>10s}")
+    print('-' * 80)
+
+    for k in ('psnr_ori', 'eval_loss'):
+        vals = [r[k] for r in all_results if k in r]
+        if vals:
+            print(f"{k:>28s} {np.mean(vals):>10.4f} {np.min(vals):>10.4f} "
+                  f"{np.max(vals):>10.4f} {np.std(vals):>10.4f}")
+
+    times = [r['time_total'] for r in all_results]
+    print(f"\nTotal: {sum(times):.0f}s  |  Avg: {np.mean(times):.1f}s/material")
+    print(f"{'='*80}")
+
+
+def _write_eval_done(mode, ckpt_dir, config_path, bc_format_name,
+                     num_workers, all_results):
+    done_data = _summarize_eval_results(all_results)
+    done_data.update({
+        'mode': mode,
+        'config': config_path,
+        'bc_format': bc_format_name,
+        'num_workers': num_workers,
+    })
+    write_done_json("eval", ckpt_dir, done_data)
+
+
+def _write_config_yaml(ckpt_dir, config):
+    with open(os.path.join(ckpt_dir, 'config.yaml'), 'w', encoding='utf-8') as f:
+        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+
+
+def _restore_model_params_from_ckpt(ckpt_dir, model_params, verbose=False):
+    ckpt_yaml = os.path.join(ckpt_dir, 'config.yaml')
+    if not os.path.exists(ckpt_yaml):
+        return
+
+    try:
+        saved = load_config(ckpt_yaml)
+    except ValueError as e:
+        with open(ckpt_yaml, 'r', encoding='utf-8') as f:
+            saved = yaml.safe_load(f)
+        if verbose:
+            print(f"Config validation warning (ignored): {e}")
+
+    ckpt_model_params = get_model_params(saved)
+    for k in ('feature_configs', 'hidden_dim', 'num_layers', 'half_pixel_offsets'):
+        model_params[k] = ckpt_model_params[k]
+    if verbose:
+        print(f"Loaded model shape from {ckpt_yaml}")
+
+
+def _prepare_train_ckpt(mode, args, config, model_params):
+    if args.ckpt:
+        ckpt_dir = args.ckpt
+        if mode == 'train-bc':
+            _restore_model_params_from_ckpt(ckpt_dir, model_params, verbose=True)
+        else:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            _write_config_yaml(ckpt_dir, config)
+        return ckpt_dir
+
+    ckpt_dir = os.path.join('checkpoints', _timestamp())
+    os.makedirs(ckpt_dir, exist_ok=True)
+    _write_config_yaml(ckpt_dir, config)
+    return ckpt_dir
+
+
+def _train_one_material(mode, name, sample, model_params, train_params,
+                        bc_format_name, device, ckpt_dir):
+    mipmaps = [m.cpu() for m in sample['mipmaps']]
+    output_dim = sample['ref_tensor'].shape[0]
+    model = None
+    t0 = time.time()
+
+    try:
+        if mode == 'train-uc':
+            save_path = os.path.join(ckpt_dir, f'{name}.pth')
+            model = train_and_save_uc(mipmaps, output_dim, model_params,
+                                      train_params, device, save_path)
+            mips_gpu = [m.to(device) for m in mipmaps]
+            metric, train_loss = evaluate_full(model, mips_gpu, device)
+            _append_uc_psnr(ckpt_dir, name, metric)
+        else:
+            save_path = _bc_ckpt_path(ckpt_dir, bc_format_name, name)
+            model = train_and_save_bc(mipmaps, output_dim, model_params,
+                                      bc_format_name, train_params, device, save_path)
+            mips_gpu = [m.to(device) for m in mipmaps]
+            metric, _ = evaluate_full(model, mips_gpu, device)
+            train_loss = _evaluate_full_loss(model, mips_gpu, device, train_params['loss_fn'])
+    finally:
+        elapsed = time.time() - t0
+
+    result = {
+        'name': name,
+        'train_loss': train_loss,
+        'time_total': elapsed,
+    }
+    if model is not None:
+        del model
+    torch.cuda.empty_cache()
+    return result, metric
+
+
+def _run_train_materials(mode, names, ds, model_params, train_params,
+                         bc_format_name, device, ckpt_dir, prefix=''):
+    results = []
+    for i, name in enumerate(names):
+        sample = ds.get_by_name(name)
+        result, metric = _train_one_material(
+            mode, name, sample, model_params, train_params,
+            bc_format_name, device, ckpt_dir,
+        )
+        results.append(result)
+        metric_str = f"BC {metric:>7.2f}" if mode == 'train-bc' else f"{metric:>7.2f}"
+        print(f"{prefix}[{i+1:>2d}/{len(names)}] {name:<30s} {metric_str} {result['time_total']:>5.1f}s", flush=True)
+    return results
+
+
+def _run_mp_train(mode, gpu_ids, names_split, config_path, ckpt_dir, num_workers):
+    import torch.multiprocessing as mp
+    mp.set_start_method('spawn', force=True)
+    task_args = [
+        (mode, gpu_ids[i % len(gpu_ids)], names_split[i], config_path, ckpt_dir)
+        for i in range(num_workers)
+    ]
+    with mp.Pool(num_workers) as pool:
+        worker_results = pool.map(_mp_train_worker, task_args)
+
+    train_results = []
+    for wr in worker_results:
+        train_results.extend(wr)
+    return train_results
+
+
+def _print_train_header(mode, train_params, bc_format_name, ckpt_dir,
+                        num_workers, gpu_ids):
+    if mode == 'train-uc':
+        print(f"=== Train UC ({train_params['total_iterations']} iters, {num_workers} workers, GPUs={gpu_ids}) ===")
+        print(f"Checkpoints → {ckpt_dir}/")
+        print(f"{'Material':<30s} {'PSNR':>7s} {'Time':>6s}")
+        print('-' * 47)
+    else:
+        print(f"=== Train BC ({bc_format_name.upper()}, {train_params['total_iterations']} iters, "
+              f"{num_workers} workers, GPUs={gpu_ids}) ===")
+        print(f"Checkpoints → {ckpt_dir}/bc_{bc_format_name}/")
+        print(f"{'Material':<30s} {'BC PSNR':>7s} {'Time':>6s}")
+        print('-' * 49)
+
+
+def _write_train_done(mode, ckpt_dir, config_path, bc_format_name,
+                      num_workers, train_results):
+    done_data = _summarize_train_results(train_results)
+    done_data.update({
+        'mode': mode,
+        'config': config_path,
+        'bc_format': bc_format_name,
+        'num_workers': num_workers,
+    })
+    if mode == 'train-bc':
+        done_data['bc_ckpt_dir'] = os.path.join(ckpt_dir, f'bc_{bc_format_name}')
+    write_done_json(mode, ckpt_dir, done_data)
+
+
+def _run_uc_eval(names, ds, model_params, device, ckpt_dir, prefix=''):
+    all_results = []
+    for i, name in enumerate(names):
+        sample = ds.get_by_name(name)
+        mipmaps = [m.cpu() for m in sample['mipmaps']]
+        try:
+            r = evaluate_uc_one(name, mipmaps, model_params, device, ckpt_dir)
+            all_results.append(r)
+            print(f"{prefix}[{i+1:>2d}/{len(names)}] ", end='', flush=True)
+            print_uc_result(r)
+        except FileNotFoundError as e:
+            print(f"{prefix}SKIP {name}: {e}", flush=True)
+        except Exception as e:
+            print(f"{prefix}ERROR on {name}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+    return all_results
+
+
+def _run_eval_uc_stage(names, ds, model_params, device, ckpt_dir,
+                       config_path, bc_format_name, num_workers,
+                       use_mp=False, gpu_ids=None, names_split=None,
+                       write_done=True):
+    params_label = f"UC fl={model_params.get('filter')}"
+    print(f"\n{'='*80}")
+    print(f"Eval UC  |  {params_label}")
+    print(f"Checkpoints from {ckpt_dir}")
+    print(f"{'='*80}")
+    print_uc_header()
+
+    if use_mp:
+        import torch.multiprocessing as mp
+        mp.set_start_method('spawn', force=True)
+        task_args = [
+            (gpu_ids[i % len(gpu_ids)], names_split[i], config_path, ckpt_dir)
+            for i in range(num_workers)
+        ]
+        with mp.Pool(num_workers) as pool:
+            worker_results = pool.map(_mp_eval_uc_worker, task_args)
+        all_results = []
+        for wr in worker_results:
+            all_results.extend(wr)
+    else:
+        all_results = _run_uc_eval(names, ds, model_params, device, ckpt_dir)
+
+    if all_results:
+        summarize_uc(all_results, params_label)
+        cfg_stem = os.path.splitext(os.path.basename(config_path))[0]
+        save_uc_tsv(all_results, ckpt_dir, cfg_stem)
+
+    if write_done:
+        _write_eval_done('eval-uc', ckpt_dir, config_path, bc_format_name, num_workers, all_results)
+    return all_results
+
+
 # ============================================================
 # 多进程 Worker
 # ============================================================
 
-def _mp_train_uc_worker(args):
-    """多进程 UC 训练 worker."""
-    gpu_id, names, config_path, ckpt_dir = args
-    device = f'cuda:{gpu_id}'
-    torch.cuda.set_device(device)
-
-    config = load_config(config_path)
-    model_params = get_model_params(config)
-    uc_params = get_uc_training_params(config)
-    dataset_params = get_dataset_params(config)
-
-    ds = MaterialDataset(dataset_params['root'], target_res=dataset_params['target_res'], preload=True)
-
-    results = []
-    for i, name in enumerate(names):
-        sample = ds.get_by_name(name)
-        mipmaps = [m.cpu() for m in sample['mipmaps']]
-        output_dim = sample['ref_tensor'].shape[0]
-        save_path = os.path.join(ckpt_dir, f'{name}.pth')
-
-        t0 = time.time()
-        model = train_and_save_uc(mipmaps, output_dim, model_params, uc_params, device, save_path)
-        mips_gpu = [m.to(device) for m in mipmaps]
-        psnr_uc, _ = evaluate_full(model, mips_gpu, device)
-        el = time.time() - t0
-        results.append((name, psnr_uc, el))
-        _append_uc_psnr(ckpt_dir, name, psnr_uc)
-        print(f"[{gpu_id}] [{i+1:>2d}/{len(names)}] {name:<30s} {psnr_uc:>7.2f} {el:>5.1f}s", flush=True)
-        del model
-        torch.cuda.empty_cache()
-    return results
-
-
-def _mp_train_bc_worker(args):
-    """多进程 BC 训练 worker."""
-    gpu_id, names, config_path, ckpt_dir = args
+def _mp_train_worker(args):
+    """多进程训练 worker."""
+    mode, gpu_id, names, config_path, ckpt_dir = args
     device = f'cuda:{gpu_id}'
     torch.cuda.set_device(device)
 
     config = load_config(config_path)
     bc_format_name = config['bc_format']
     model_params = get_model_params(config)
-    bc_params = get_bc_training_params(config)
+    train_params = get_uc_training_params(config) if mode == 'train-uc' else get_bc_training_params(config)
     dataset_params = get_dataset_params(config)
 
-    ckpt_yaml = os.path.join(ckpt_dir, 'config.yaml')
-    if os.path.exists(ckpt_yaml):
-        try:
-            saved = load_config(ckpt_yaml)
-        except ValueError:
-            with open(ckpt_yaml, 'r', encoding='utf-8') as f:
-                saved = yaml.safe_load(f)
-        ckpt_model_params = get_model_params(saved)
-        for k in ('feature_configs', 'hidden_dim', 'num_layers', 'half_pixel_offsets'):
-            model_params[k] = ckpt_model_params[k]
+    if mode == 'train-bc':
+        _restore_model_params_from_ckpt(ckpt_dir, model_params)
 
-    ds = MaterialDataset(dataset_params['root'], target_res=dataset_params['target_res'], preload=True)
-
-    results = []
-    for i, name in enumerate(names):
-        sample = ds.get_by_name(name)
-        mipmaps = [m.cpu() for m in sample['mipmaps']]
-        output_dim = sample['ref_tensor'].shape[0]
-        save_path = _bc_ckpt_path(ckpt_dir, bc_format_name, name)
-
-        t0 = time.time()
-        bc_model = train_and_save_bc(mipmaps, output_dim, model_params, bc_format_name,
-                                      bc_params, device, save_path)
-        mips_gpu = [m.to(device) for m in mipmaps]
-        psnr_bc, _ = evaluate_full(bc_model, mips_gpu, device)
-        el = time.time() - t0
-        results.append((name, psnr_bc, el))
-        print(f"[{gpu_id}] [{i+1:>2d}/{len(names)}] {name:<30s} BC {psnr_bc:>7.2f} {el:>5.1f}s", flush=True)
-        del bc_model
-        torch.cuda.empty_cache()
-    return results
+    ds = MaterialDataset(dataset_params['root'], target_res=dataset_params['target_res'],
+                         preload=True, output_channels=dataset_params.get('output_channels', 'full'))
+    return _run_train_materials(
+        mode, names, ds, model_params, train_params,
+        bc_format_name, device, ckpt_dir, prefix=f"[{gpu_id}] ",
+    )
 
 
 def _mp_eval_worker(args):
@@ -741,7 +1055,8 @@ def _mp_eval_worker(args):
     model_params = get_model_params(config)
     dataset_params = get_dataset_params(config)
 
-    ds = MaterialDataset(dataset_params['root'], target_res=dataset_params['target_res'], preload=True)
+    ds = MaterialDataset(dataset_params['root'], target_res=dataset_params['target_res'],
+                         preload=True, output_channels=dataset_params.get('output_channels', 'full'))
     ds_root = dataset_params['root']
 
     ckpt_yaml = os.path.join(ckpt_dir, 'config.yaml')
@@ -764,10 +1079,9 @@ def _mp_eval_worker(args):
                              device, ckpt_dir, ds_root, bench_params,
                              vis_dir=vis_dir)
             all_results.append(r)
-            uc_str = f"{r['psnr_unconstrained']:>7.2f}" if 'psnr_unconstrained' in r else f"{'N/A':>7s}"
             drop_str = f"{r['psnr_drop']:>6.2f}" if 'psnr_drop' in r else f"{'N/A':>6s}"
             print(f"[{gpu_id}] [{i+1:>2d}/{len(names)}] {r['name']:<30s} "
-                  f"{r['psnr_bc']:>7.2f} {uc_str} {drop_str} "
+                  f"{r['psnr_bc']:>7.2f} {drop_str} "
                   f"{r['inference_ms']:>8.3f} "
                   f"{r['compression_ratio']:>7.4f} {r['time_total']:>5.1f}s", flush=True)
         except FileNotFoundError as e:
@@ -777,6 +1091,22 @@ def _mp_eval_worker(args):
             import traceback
             traceback.print_exc()
     return all_results
+
+
+def _mp_eval_uc_worker(args):
+    """多进程 UC eval worker."""
+    gpu_id, names, config_path, ckpt_dir = args
+    device = f'cuda:{gpu_id}'
+    torch.cuda.set_device(device)
+
+    config = load_config(config_path)
+    model_params = get_model_params(config)
+    dataset_params = get_dataset_params(config)
+    _restore_model_params_from_ckpt(ckpt_dir, model_params)
+
+    ds = MaterialDataset(dataset_params['root'], target_res=dataset_params['target_res'],
+                         preload=True, output_channels=dataset_params.get('output_channels', 'full'))
+    return _run_uc_eval(names, ds, model_params, device, ckpt_dir, prefix=f"[{gpu_id}] ")
 
 
 # ============================================================
@@ -791,6 +1121,8 @@ def main():
                         help='训练并保存 UC (无约束) 基线模型')
     parser.add_argument('--train-bc', action='store_true',
                         help='训练并保存 BC 压缩模型')
+    parser.add_argument('--eval-uc', action='store_true',
+                        help='只评估 UC (无约束) 基线模型')
     parser.add_argument('--ckpt', type=str, default=None,
                         help='checkpoint 目录 (--train-bc 可选, eval 必需)')
     parser.add_argument('--materials', type=str, default=None,
@@ -814,7 +1146,8 @@ def main():
     ds_root = dataset_params['root']
     target_res = dataset_params['target_res']
 
-    ds = MaterialDataset(ds_root, target_res=target_res, preload=True)
+    ds = MaterialDataset(ds_root, target_res=target_res, preload=True,
+                         output_channels=dataset_params.get('output_channels', 'full'))
     print(f"Device: {device}  |  Config: {args.config}  |  Res: {target_res}")
     print(f"BC format: {bc_format_name.upper()}  |  Filter: {model_params.get('filter')}")
     print(f"Loaded {len(ds)} materials from {ds_root}\n")
@@ -837,121 +1170,64 @@ def main():
         names_split[i % num_workers].append(name)
 
     def _restore_model_params(ckpt_dir):
-        ckpt_yaml = os.path.join(ckpt_dir, 'config.yaml')
-        if os.path.exists(ckpt_yaml):
-            try:
-                saved = load_config(ckpt_yaml)
-            except ValueError as e:
-                with open(ckpt_yaml, 'r', encoding='utf-8') as f:
-                    saved = yaml.safe_load(f)
-                print(f"Config validation warning (ignored): {e}")
-            ckpt_model_params = get_model_params(saved)
-            for k in ('feature_configs', 'hidden_dim', 'num_layers', 'half_pixel_offsets'):
-                model_params[k] = ckpt_model_params[k]
-            print(f"Loaded model shape from {ckpt_yaml}")
+        _restore_model_params_from_ckpt(ckpt_dir, model_params, verbose=True)
 
     # ========================================================
     # 阶段1: train-uc
     # ========================================================
     if args.train_uc:
         uc_params = get_uc_training_params(config)
-        ckpt_dir = os.path.join('checkpoints', _timestamp())
-        os.makedirs(ckpt_dir, exist_ok=True)
-
-        with open(os.path.join(ckpt_dir, 'config.yaml'), 'w', encoding='utf-8') as f:
-            yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-
-        print(f"=== Train UC ({uc_params['total_iterations']} iters, {num_workers} workers, GPUs={gpu_ids}) ===")
-        print(f"Checkpoints → {ckpt_dir}/")
-        print(f"{'Material':<30s} {'PSNR':>7s} {'Time':>6s}")
-        print('-' * 47)
-
+        ckpt_dir = _prepare_train_ckpt('train-uc', args, config, model_params)
+        _print_train_header('train-uc', uc_params, bc_format_name, ckpt_dir, num_workers, gpu_ids)
         if use_mp:
-            import torch.multiprocessing as mp
-            mp.set_start_method('spawn', force=True)
-            task_args = [
-                (gpu_ids[i % len(gpu_ids)], names_split[i], args.config, ckpt_dir)
-                for i in range(num_workers)
-            ]
-            with mp.Pool(num_workers) as pool:
-                worker_results = pool.map(_mp_train_uc_worker, task_args)
-            total_trained = sum(len(wr) for wr in worker_results)
-            print(f"\nDone. Trained {total_trained} materials.")
-            print(f"Next: python Tool.py --config {args.config} --train-bc --ckpt {ckpt_dir}/")
+            train_results = _run_mp_train('train-uc', gpu_ids, names_split, args.config, ckpt_dir, num_workers)
         else:
-            for i, name in enumerate(names):
-                sample = ds.get_by_name(name)
-                mipmaps = [m.cpu() for m in sample['mipmaps']]
-                output_dim = sample['ref_tensor'].shape[0]
-                save_path = os.path.join(ckpt_dir, f'{name}.pth')
-
-                t0 = time.time()
-                model = train_and_save_uc(mipmaps, output_dim, model_params,
-                                          uc_params, device, save_path)
-                mips_gpu = [m.to(device) for m in mipmaps]
-                psnr_uc, _ = evaluate_full(model, mips_gpu, device)
-                el = time.time() - t0
-                _append_uc_psnr(ckpt_dir, name, psnr_uc)
-                print(f"[{i+1:>2d}/{len(names)}] {name:<30s} {psnr_uc:>7.2f} {el:>5.1f}s", flush=True)
-                del model
-                torch.cuda.empty_cache()
-
-            print(f"\nDone. Next: python Tool.py --config {args.config} --train-bc --ckpt {ckpt_dir}/")
+            train_results = _run_train_materials(
+                'train-uc', names, ds, model_params, uc_params,
+                bc_format_name, device, ckpt_dir,
+            )
+        print(f"\nDone. Trained {len(train_results)} materials.")
+        _write_train_done('train-uc', ckpt_dir, args.config, bc_format_name, num_workers, train_results)
+        
+        print(f"Next: python Tool.py --config {args.config} --train-bc --ckpt {ckpt_dir}/")
         return
 
     # ========================================================
     # 阶段2: train-bc
     # ========================================================
     if args.train_bc:
-        if args.ckpt:
-            ckpt_dir = args.ckpt
-            _restore_model_params(ckpt_dir)
-        else:
-            ckpt_dir = os.path.join('checkpoints', _timestamp())
-            os.makedirs(ckpt_dir, exist_ok=True)
-            with open(os.path.join(ckpt_dir, 'config.yaml'), 'w', encoding='utf-8') as f:
-                yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-
-        print(f"=== Train BC ({bc_format_name.upper()}, {bc_params['total_iterations']} iters, "
-              f"{num_workers} workers, GPUs={gpu_ids}) ===")
-        print(f"Checkpoints → {ckpt_dir}/bc_{bc_format_name}/")
-        print(f"{'Material':<30s} {'BC PSNR':>7s} {'Time':>6s}")
-        print('-' * 49)
-
+        ckpt_dir = _prepare_train_ckpt('train-bc', args, config, model_params)
+        _print_train_header('train-bc', bc_params, bc_format_name, ckpt_dir, num_workers, gpu_ids)
         if use_mp:
-            import torch.multiprocessing as mp
-            mp.set_start_method('spawn', force=True)
-            task_args = [
-                (gpu_ids[i % len(gpu_ids)], names_split[i], args.config, ckpt_dir)
-                for i in range(num_workers)
-            ]
-            with mp.Pool(num_workers) as pool:
-                worker_results = pool.map(_mp_train_bc_worker, task_args)
-            total_trained = sum(len(wr) for wr in worker_results)
-            print(f"\nDone. Trained {total_trained} BC models.")
-            print(f"Next: python Tool.py --config {args.config} --ckpt {ckpt_dir}/")
+            train_results = _run_mp_train('train-bc', gpu_ids, names_split, args.config, ckpt_dir, num_workers)
         else:
-            for i, name in enumerate(names):
-                sample = ds.get_by_name(name)
-                mipmaps = [m.cpu() for m in sample['mipmaps']]
-                output_dim = sample['ref_tensor'].shape[0]
-                save_path = _bc_ckpt_path(ckpt_dir, bc_format_name, name)
-
-                t0 = time.time()
-                bc_model = train_and_save_bc(mipmaps, output_dim, model_params, bc_format_name,
-                                              bc_params, device, save_path)
-                mips_gpu = [m.to(device) for m in mipmaps]
-                psnr_bc, _ = evaluate_full(bc_model, mips_gpu, device)
-                el = time.time() - t0
-                print(f"[{i+1:>2d}/{len(names)}] {name:<30s} {psnr_bc:>7.2f} {el:>5.1f}s", flush=True)
-                del bc_model
-                torch.cuda.empty_cache()
-
-            print(f"\nDone. Next: python Tool.py --config {args.config} --ckpt {ckpt_dir}/")
+            train_results = _run_train_materials(
+                'train-bc', names, ds, model_params, bc_params,
+                bc_format_name, device, ckpt_dir,
+            )
+        print(f"\nDone. Trained {len(train_results)} BC models.")
+        _write_train_done('train-bc', ckpt_dir, args.config, bc_format_name, num_workers, train_results)
+        print(f"Next: python Tool.py --config {args.config} --ckpt {ckpt_dir}/")
         return
 
     # ========================================================
-    # 阶段3: eval
+    # 阶段3: eval-uc
+    # ========================================================
+    if args.eval_uc:
+        if not args.ckpt:
+            print("ERROR: eval-uc 模式需要 --ckpt <checkpoints/xxx/>")
+            sys.exit(1)
+        ckpt_dir = args.ckpt
+        _restore_model_params(ckpt_dir)
+        _run_eval_uc_stage(
+            names, ds, model_params, device, ckpt_dir, args.config,
+            bc_format_name, num_workers, use_mp=use_mp,
+            gpu_ids=gpu_ids, names_split=names_split,
+        )
+        return
+
+    # ========================================================
+    # 阶段4: eval
     # ========================================================
     if not args.ckpt:
         print("ERROR: eval 模式需要 --ckpt <checkpoints/xxx/>")
@@ -1019,6 +1295,8 @@ def main():
         print(f"\nWorst 3 (highest BC drop):")
         for r in sorted_by_drop[-3:]:
             print(f"  {r['name']:<30s} drop={r['psnr_drop']:.2f} dB")
+
+    _write_eval_done('eval', ckpt_dir, args.config, bc_format_name, num_workers, all_results)
 
 
 if __name__ == '__main__':
