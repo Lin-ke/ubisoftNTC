@@ -6,9 +6,15 @@ from dataset import build_mipmaps
 
 
 def sample_reference(mips, uv, scale, filter_mode='bicubic'):
-    """Sample reference with given spatial filter at two closest mips, linearly mix.
+    """Sample reference (GT) with bicubic spatial filtering on the two closest mips,
+    then linearly mix by lambda = s - floor(s).
 
-    filter_mode: 'bicubic' (default, backward compat) or 'trilinear' (→ bilinear spatial)
+    NOTE (paper-aligned, Sec 5.1):
+        GT 必须永远用 bicubic + 双 mip 线性混合, 与神经特征侧的 trilinear 解耦.
+        - GT 端 (本函数):    spatial = bicubic       (always)
+        - 神经特征端:        spatial = bilinear (trilinear)  -> 由 model.filter 控制
+        因此训练循环里调用本函数应永远传 filter_mode='bicubic'.
+        旧 'trilinear' 走 bilinear 的分支保留仅为向后兼容, 不应在新训练中使用.
     """
     spatial_mode = 'bilinear' if filter_mode == 'trilinear' else 'bicubic'
 

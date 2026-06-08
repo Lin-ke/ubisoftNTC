@@ -145,3 +145,48 @@ Compression后应该做QAT，以解决压缩目标（重建参数图）和解压
 - plan: 与 bc1_bcf05k（L1基线）对比，考察 MSE loss 对 PSNR 的影响
 - status: UC ✅ → BC 训练中 (18/20, ckpt=2026-06-08_010508)
 - hypothesis: MSE 直接优化 PSNR 相关目标，可能比 L1 得到更高 PSNR
+
+## 2026-06-08 23:50 论文对齐重大修复：原图保留 + GT/feature 滤波解耦
+
+### 背景
+读 BCf 原文 (Weinreich 2024) Sec 5.1 / 4.3，发现本工程当前训练存在两处与论文不一致：
+1. **原图被下采样**：yaml `dataset.target_res=256`，原生 2048×2048 PNG 被 bicubic 下采到 256，再从 256 构 mip 金字塔（仅 9 层）。论文要求**直接从 2K 构金字塔**（12 层：2048→1024→…→1）。
+2. **GT 与神经特征滤波被绑定**：`Tool.py` 训练循环把 `model_params['filter']`（=`trilinear`）传给 `sample_reference` 当 GT 滤波器，导致 GT 走 bilinear；论文 Sec 5.1 明确 GT 永远 bicubic（双 mip 线性混合），而 trilinear 仅用于神经特征侧（Sec 4.3，硬件 sampler 模拟）。
+
+### 修复
+- `ntc_config.py:get_dataset_params` 强制 `target_res=None`，yaml 中遗留值给 WARN 后忽略
+- `Tool.py:train_and_save_uc` / `train_bc_model` 训练循环里硬编码 `gt_filter='bicubic'`，与 `model.filter` 解耦
+- `ntc_train.py:sample_reference` 仅加注释明确语义
+- 启动信息加 `Filter: trilinear (feature) | GT filter: bicubic` 显示
+- `dataset.py` 未改（`target_res=None` 时本就保留原图）
+
+### 影响
+- 训练时每条材质会保留 12 层 mip pyramid（2K→1），CPU RAM 占用 ≈3.8GB / 20 mat（preload）
+- batch 仍是 `batch_res×batch_res` uv 窗口，但底层 GT 来自更高层的 mip → 高频细节学得到
+- 旧 ckpt 不受影响；新跑的实验 PSNR 数值不可与历史 results.tsv 直接对比（GT 变了）
+- 烟测 `smoke_10iter` 跑通：UC 10 iter 2.8s + BC 10 iter 2.7s（aerial_beach_02，单卡）
+
+### TODO（后续）
+- 重跑 bc1_bcf05k 基线，记录 PSNR 变化作为新 baseline
+- batch 采样目前还是 `_sample_uv_and_lod` 的小窗口（`batch_res/ref_w` ≈ 6%），论文是覆盖整个 [0,1]² 的均匀 grid，可能下一步也要修
+- max_useful_lod 之类的剪枝逻辑要重新评估：原来按 9 层 mip 调的，现在 12 层
+
+## 2026-06-09 BC eval 量化 bug 修复 + MLP finetune 阶段
+
+### Eval 量化 bug 修复
+- problem: 'ntc_bc_model.py:138 _quantize_ste' 在 'self.training=False' 下直接 'return x' (未量化的连续 sigmoid 值). 导致 'evaluate_full()' 走 'model.eval()' 时, BC features 不是真正的离散量化值, psnr_bc 偏乐观.
+- fix: 'eval' 也走 round 量化 (无需 STE, 因为不需要梯度); train 路径不变.
+- 影响: 历史 eval 结果不再可与新 eval 对比.
+
+### MLP Finetune 阶段 (论文 Sec 6.2 第三阶段)
+- 在 'train_bc_model()' 主 QAT loop 后内嵌:
+  1. 'feat_params.requires_grad_(False)' 冻结 BC endpoints/indices
+  2. 新建只含 'mlp.parameters()' 的 Adam optimizer (lr 默认沿用 lr_mlp)
+  3. 跑 'mlp_finetune_iterations' 迭代 (默认 1000)
+  4. 退出前恢复 requires_grad
+- yaml schema 新增 (都有默认值, 旧 config 不写也能跑):
+  - 'bc_training.mlp_finetune_iterations' (default 1000)
+  - 'bc_training.mlp_finetune_lr'         (default = lr_mlp)
+  - 'bc_training.mlp_finetune_gamma'      (default 1.0)
+- 不处理 BC1 endpoint 顺序 / color mode — 等做真实导出再说, 当前训练 forward 是对称线段, 顺序无影响.
+

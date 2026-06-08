@@ -136,10 +136,15 @@ class BCBlockFeature(nn.Module):
         )
 
     def _quantize_ste(self, x, levels_minus_one):
-        if not self.training:
-            return x
+        """硬量化 (round 到 N 档).
+
+        - 训练:  forward = xq (硬量化值), backward 走 STE (梯度直通连续参数 x).
+        - 评估:  forward = xq, 不再返回未量化的连续值 (修复历史 eval 偏乐观 bug).
+        """
         levels = float(levels_minus_one)
         xq = (x * levels).round().clamp(0, levels) / levels
+        if not self.training:
+            return xq
         return x + (xq - x).detach()
 
     def forward(self):

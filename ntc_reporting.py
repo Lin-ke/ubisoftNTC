@@ -1,0 +1,152 @@
+import os
+
+import numpy as np
+
+from ntc_utils import write_done_json
+
+
+def print_header():
+    hdr = (f"{'Material':<30s} {'BC(dB)':>7s} {'Drop':>6s} "
+           f"{'Inf(ms)':>8s} {'CR':>7s} {'Time':>6s}")
+    print(hdr)
+    print('-' * 78)
+
+
+def print_uc_header():
+    print(f"{'Material':<30s} {'UC(dB)':>7s} {'Loss':>12s} {'Time':>6s}")
+    print('-' * 62)
+
+
+def print_result(r):
+    drop_str = f"{r['psnr_drop']:>6.2f}" if 'psnr_drop' in r else f"{'N/A':>6s}"
+    print(f"{r['name']:<30s} {r['psnr_bc']:>7.2f} {drop_str} "
+          f"{r['inference_ms']:>8.3f} {r['compression_ratio']:>7.4f} "
+          f"{r['time_total']:>5.1f}s")
+
+
+def print_uc_result(r):
+    print(f"{r['name']:<30s} {r['psnr_ori']:>7.2f} "
+          f"{r['eval_loss']:>12.8f} {r['time_total']:>5.1f}s")
+
+
+def summarize(all_results, params_label):
+    print(f"\n{'='*80}")
+    print(f"Aggregate over {len(all_results)} materials  "
+          f"({all_results[0].get('resolution','?')}, {params_label}):")
+    print(f"{'Metric':>28s} {'Mean':>10s} {'Min':>10s} {'Max':>10s} {'Std':>10s}")
+    print('-' * 80)
+
+    has_ori = any('psnr_ori' in r for r in all_results)
+    if has_ori:
+        metrics = ['psnr_ori', 'psnr_bc', 'psnr_drop']
+    else:
+        metrics = ['psnr_bc']
+    metrics += ['inference_ms', 'compression_ratio']
+
+    for k in metrics:
+        vals = [r[k] for r in all_results if k in r]
+        if not vals:
+            continue
+        print(f"{k:>28s} {np.mean(vals):>10.4f} {np.min(vals):>10.4f} "
+              f"{np.max(vals):>10.4f} {np.std(vals):>10.4f}")
+
+    times = [r['time_total'] for r in all_results]
+    print(f"\nTotal: {sum(times):.0f}s  |  Avg: {np.mean(times):.1f}s/material")
+    print(f"{'='*80}")
+
+
+def summarize_uc(all_results, params_label):
+    print(f"\n{'='*80}")
+    print(f"UC Eval aggregate over {len(all_results)} materials  "
+          f"({all_results[0].get('resolution','?')}, {params_label}):")
+    print(f"{'Metric':>28s} {'Mean':>10s} {'Min':>10s} {'Max':>10s} {'Std':>10s}")
+    print('-' * 80)
+
+    for k in ('psnr_ori', 'eval_loss'):
+        vals = [r[k] for r in all_results if k in r]
+        if vals:
+            print(f"{k:>28s} {np.mean(vals):>10.4f} {np.min(vals):>10.4f} "
+                  f"{np.max(vals):>10.4f} {np.std(vals):>10.4f}")
+
+    times = [r['time_total'] for r in all_results]
+    print(f"\nTotal: {sum(times):.0f}s  |  Avg: {np.mean(times):.1f}s/material")
+    print(f"{'='*80}")
+
+
+def save_tsv(all_results, ckpt_dir, suffix):
+    path = os.path.join(ckpt_dir, f'eval_{suffix}.tsv')
+    cols = ['name', 'channels', 'resolution',
+            'psnr_ori', 'psnr_bc', 'psnr_drop',
+            'inference_ms', 'bc_bits', 'png_bits', 'compression_ratio',
+            'time_total']
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\t'.join(cols) + '\n')
+        for r in all_results:
+            f.write('\t'.join(str(r.get(c, '')) for c in cols) + '\n')
+    print(f"Saved to {path}")
+
+
+def save_uc_tsv(all_results, ckpt_dir, suffix):
+    path = os.path.join(ckpt_dir, f'eval_uc_{suffix}.tsv')
+    cols = ['name', 'channels', 'resolution', 'psnr_ori', 'eval_loss', 'time_total']
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\t'.join(cols) + '\n')
+        for r in all_results:
+            f.write('\t'.join(str(r.get(c, '')) for c in cols) + '\n')
+    print(f"Saved to {path}")
+
+
+def _summarize_train_results(results):
+    times = [r['time_total'] for r in results]
+    losses = [r['train_loss'] for r in results if r.get('train_loss') is not None]
+    data = {
+        'time_total': round(sum(times), 3) if times else 0.0,
+        'time_avg': round(float(np.mean(times)), 3) if times else 0.0,
+        'num_materials': len(results),
+    }
+    if losses:
+        data['train_loss'] = round(float(np.mean(losses)), 8)
+        data['train_loss_min'] = round(float(np.min(losses)), 8)
+        data['train_loss_max'] = round(float(np.max(losses)), 8)
+    return data
+
+
+def _summarize_eval_results(all_results):
+    data = {'num_materials': len(all_results)}
+    for k in ('psnr_ori', 'psnr_bc', 'psnr_drop', 'inference_ms', 'compression_ratio', 'eval_loss'):
+        vals = [r[k] for r in all_results if k in r]
+        if vals:
+            data[k] = round(float(np.mean(vals)), 6)
+            data[f'{k}_min'] = round(float(np.min(vals)), 6)
+            data[f'{k}_max'] = round(float(np.max(vals)), 6)
+    times = [r['time_total'] for r in all_results if 'time_total' in r]
+    if times:
+        data['time_total'] = round(float(np.sum(times)), 3)
+        data['time_avg'] = round(float(np.mean(times)), 3)
+    return data
+
+
+def _write_eval_done(mode, ckpt_dir, config_path, bc_format_name,
+                     num_workers, all_results):
+    done_data = _summarize_eval_results(all_results)
+    done_data.update({
+        'mode': mode,
+        'config': config_path,
+        'bc_format': bc_format_name,
+        'num_workers': num_workers,
+    })
+    write_done_json("eval", ckpt_dir, done_data)
+
+
+def _write_train_done(mode, ckpt_dir, config_path, bc_format_name,
+                      num_workers, train_results):
+    done_data = _summarize_train_results(train_results)
+    done_data.update({
+        'mode': mode,
+        'config': config_path,
+        'bc_format': bc_format_name,
+        'num_workers': num_workers,
+    })
+    if mode == 'train-bc':
+        done_data['bc_ckpt_dir'] = os.path.join(ckpt_dir, f'bc_{bc_format_name}')
+    write_done_json(mode, ckpt_dir, done_data)
