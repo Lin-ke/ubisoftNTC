@@ -14,18 +14,24 @@ model:
   hidden_dim: 16
 
 uc_training:
-  total_iterations: 10000
+  total_iterations: 5000
   batch_res: 128
   lr_feat: 5.0e-2
   lr_mlp: 1.0e-3
-  gamma: 0.9995
+  gamma: 0.9999
 
 bc_training:
-  total_iterations: 10000
+  total_iterations: 200000
   batch_res: 128
   lr_feat: 1.0e-2
   lr_mlp: 1.0e-3
   betas: [0.9, 0.999]
+bc_mlp_training:
+  total_iterations: 1000
+  batch_res: 128
+  lr_mlp: 1.0e-3
+  betas: [0.9, 0.999]
+
 
 dataset:
   root: dataset

@@ -1,13 +1,15 @@
-# BC1 baseline — 2层特征网格, hidden_dim=16
+# BC1 — 512 res, 2-layer MLP (12→16→16→9)
 bc_format: bc1
 loss: l1
 
 model:
   filter: trilinear
-  num_layers: 1
-  half_pixel_offsets: [1]
+  num_layers: 2
+  half_pixel_offsets: [1, 3]
   feature_configs:
     - [512, 8, 3]
+    - [256, 7, 3]
+    - [128, 6, 3]
     - [64, 5, 3]
   hidden_dim: 16
 
@@ -16,7 +18,7 @@ uc_training:
   batch_res: 128
   lr_feat: 5.0e-2
   lr_mlp: 1.0e-3
-  gamma: 0.9995
+  gamma: 0.9999
 
 bc_training:
   total_iterations: 200000

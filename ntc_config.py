@@ -100,6 +100,7 @@ def get_model_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'num_layers': m.get('num_layers', 1),
         'filter': m.get('filter', 'trilinear'),
         'half_pixel_offsets': m.get('half_pixel_offsets', []),
+        'output_activation': m.get('output_activation', 'none'),
     }
 
 
@@ -113,6 +114,7 @@ def get_uc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'lr_feat': t.get('lr_feat', 5.0e-2),
         'lr_mlp': t.get('lr_mlp', 1.0e-3),
         'gamma': t.get('gamma', 0.9995),
+        'loss_fn': config.get('loss', 'l1'),
         'loss_channels': t.get('loss_channels', None),
         'max_useful_lod': t.get('max_useful_lod', None),
     }
@@ -130,10 +132,6 @@ def get_bc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'loss_fn': config.get('loss', 'l1'),
         'loss_channels': t.get('loss_channels', None),
         'max_useful_lod': t.get('max_useful_lod', None),
-        # 论文 Sec 6.2 第三阶段: 冻结 BC features, 仅 finetune MLP.
-        'mlp_finetune_iterations': t.get('mlp_finetune_iterations', 1000),
-        'mlp_finetune_lr': t.get('mlp_finetune_lr', t.get('lr_mlp', 1.0e-3)),
-        'mlp_finetune_gamma': t.get('mlp_finetune_gamma', 1.0),
     }
 
 
@@ -157,6 +155,17 @@ def get_dataset_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'root': d.get('root', 'dataset'),
         'target_res': None,  # 强制原生分辨率, 见 docstring
         'output_channels': d.get('output_channels', 'full'),
+    }
+
+
+def get_bc_mlp_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
+    t = config.get('bc_mlp_training', config.get('bc_training', {}))
+    return {
+        'total_iterations': t.get('total_iterations', 1000),
+        'batch_res': t.get('batch_res', 128),
+        'lr_mlp': t.get('lr_mlp', 1.0e-3),
+        'betas': t.get('betas', [0.9, 0.999]),
+        'loss_fn': config.get('loss', 'l1'),
     }
 
 

@@ -7,11 +7,11 @@
 ## 项目概述
 
 ### 核心目标（不变）
-- **Primary**: 最小化 `psnr_drop = psnr_原图 - psnr_bc`。越低越好。
+- **Primary**: 最小化 `psnr_drop = psnr_bc_ref - psnr_bc`（传统BC vs 神经网络BC）。越低越好。
 - **Secondary**: 跟踪推理时延 `inference_ms` 和压缩率 `compression_ratio = bc_bits / png_bits`，时延要尽可能低。你需要在保证模型的实验的情况下，尽量提高PSNR；其次是提高压缩率。
 
 ### 当前探索方向
-技术路线大体为：Train UC-> 量化 -> 量化感知训练（QAT）。Train UC，而后加载其ckpt、量化并train BC直到结束。
+技术路线：`--train` 一键执行三阶段流水线 UC → BC QAT → BC-MLP finetune，内部自动衔接。
 
 其他见**notes.md**
 
@@ -36,7 +36,7 @@ ntc/
 ├── ntc_compare.py          # BC 格式一键对比工具（Fixed）
 ├── ntc_utils.py            # 公共工具：法线重建、图像保存、PSNR 计算（Fixed）
 ├── ntc_config.py           # YAML 配置加载与校验（可修改）
-├── Tool.py                 # 主入口：训练 UC / 训练 BC / 评估（可修改）
+├── Tool.py                 # 主入口：--train 一键流水线 / eval（可修改）
 ├── train_start.py          # 一键启动包装器（可修改）
 ├── train_stop.py           # 一键停止包装器（可修改）
 ├── watchdog.ps1            # PowerShell 守护脚本，防止会话闲置
@@ -57,8 +57,8 @@ ntc/
   - `BCFormat` / `BC1Format` / `BC2Format` / `BC3Format` / `BC4Format` / `BC5Format`：定义各 BC 格式的端点位深与索引位深。
   - `BCBlockFeature`：4×4 块级别的可微 BC 压缩特征层，使用 STE（Straight-Through Estimator）量化。
   - `NeuralBCTextureModel`：与 UC 模型结构相同，但特征网格使用 BC 压缩版本。
-- **`Tool.py`**：三段式主入口 — `train-uc` → `train-bc` → `eval`。
-- **`ntc_config.py`**：唯一配置入口，YAML schema 包括 `bc_format`、`model`、`uc_training`、`bc_training`、`dataset`、`benchmark`。
+- **`Tool.py`**：主入口 — `--train` 一键流水线 (UC → BC → BC-MLP) → `eval`。
+- **`ntc_config.py`**：唯一配置入口，YAML schema 包括 `bc_format`、`model`、`uc_training`、`bc_training`、`bc_mlp_training`、`dataset`、`benchmark`。
 
 ---
 
@@ -68,18 +68,14 @@ ntc/
 ### 直接调用 Tool.py
 
 Tool.py的调用指南：
-usage: Tool.py [-h] --config CONFIG [--train-uc]
-               [--train-bc] [--ckpt CKPT]
+usage: Tool.py [-h] --config CONFIG [--train] [--ckpt CKPT]
                [--materials MATERIALS] [--vis-dir VIS_DIR]
                [--num-workers NUM_WORKERS] [--gpus GPUS]
 
 
 ```bash
-# Train BC (4 worker parallel)
-python Tool.py --config configs/bc1_bcf05k.yaml --train-bc --num-workers 4
-
-# Train UC (optional, for PSNR drop comparison)
-python Tool.py --config configs/bc1_bcf05k.yaml --train-uc --num-workers 4
+# Train (一键流水线: UC → BC → BC-MLP, 4 worker parallel)
+python Tool.py --config configs/bc1_bcf05k.yaml --train --num-workers 4
 
 # Eval (4 worker parallel, reuse same --ckpt)
 python Tool.py --config configs/bc1_bcf05k.yaml --ckpt checkpoints/<ts>/ --num-workers 4
@@ -118,16 +114,22 @@ model:
   half_pixel_offsets: [1, 3]  # 在哪些 feature grid 索引上施加半像素偏移
 
 uc_training:
-  total_iterations: 10000
+  total_iterations: 5000
   batch_res: 128
   lr_feat: 5.0e-2
   lr_mlp: 1.0e-3
   gamma: 0.9995
 
 bc_training:
-  total_iterations: 10000
+  total_iterations: 200000
   batch_res: 128
   lr_feat: 1.0e-2
+  lr_mlp: 1.0e-3
+  betas: [0.9, 0.999]
+
+bc_mlp_training:
+  total_iterations: 1000
+  batch_res: 128
   lr_mlp: 1.0e-3
   betas: [0.9, 0.999]
 
@@ -158,8 +160,10 @@ Train UC
     → checkpoints/<ts>/<name>.pth + config.yaml + uc_psnr.tsv
 Train BC (QAT)
     → checkpoints/<ts>/bc_<format>/<name>.pth
+Train BC-MLP (finetune)
+    → checkpoints/<ts>/bc_<format>_mlp/<name>.pth
 Eval
-    → psnr_bc, psnr_drop (if UC exists), inference_ms, compression_ratio
+    → psnr_bc_ref, psnr_bc, psnr_drop, inference_ms, compression_ratio
     → <ckpt>/eval_<config-stem>.tsv
 ```
 
@@ -167,10 +171,11 @@ Eval
 
 | 指标 | 说明 |
 |------|------|
-| `psnr_bc` | BC 压缩模型 PSNR |
+| `psnr_bc_ref` | 传统 BC 压缩 PSNR（baseline reference） |
+| `psnr_bc` | 神经网络 BC 模型 PSNR |
+| `psnr_drop` | `psnr_bc_ref - psnr_bc` |
 | `inference_ms` | BC 前向推理时延（全分辨率 UV grid） |
 | `compression_ratio` | `bc_bits / png_bits`，越低压缩越强 |
-| `psnr_ori` | 原图 PSNR |
 ---
 
 ## 测试策略
@@ -201,10 +206,9 @@ Eval
 
 | 任务 | 命令/文件 |
 |------|----------|
-| 启动 UC 训练 | `python train_start.py --mode train-uc`（默认后台） |
-| 启动 BC 训练 | `python train_start.py --mode train-bc --ckpt checkpoints/<ts>/` |
+| 启动训练 | `python train_start.py --mode train`（默认后台） |
 | 评估 | `python train_start.py --mode eval --ckpt checkpoints/<ts>/` |
-| 前台运行 | `python train_start.py --mode train-uc --foreground` |
+| 前台运行 | `python train_start.py --mode train --foreground` |
 | 停止训练 | `python train_stop.py` |
 | 查看结果 | `grep -E "^\s*(psnr_drop|inference_ms|compression_ratio)" run.log` |
 | 实验笔记 | 追加到 `notes.md` |
@@ -221,4 +225,4 @@ c- 禁止行为：不要使用 `tail -f`、`Get-Content -Wait`、循环轮询日
 
 
 ## 执行流程
-Train UC, Train BC, Eval BC。
+Train UC → Train BC → Train BC-MLP → Eval BC。

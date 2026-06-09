@@ -4,115 +4,42 @@ import os
 import sys
 import time
 import argparse
-import types
 
 from dataset import MaterialDataset
 from ntc_model import make_model
 from ntc_bc_model import make_bc_model
 from ntc_train import sample_reference, evaluate_full
 from ntc_bc_train import sample_lod_vaidyanathan
+from ntc_utils import compute_traditional_bc_psnr
 from ntc_config import (
     load_config,
     get_model_params,
     get_uc_training_params,
     get_bc_training_params,
+    get_bc_mlp_training_params,
     get_dataset_params,
     get_benchmark_params,
 )
-from ntc_visualization import (
-    _normalize_channel_names,
-    _default_inference_channels,
-    _channel_indices,
-    visualize_comparison,
-)
+from ntc_visualization import visualize_comparison
 from ntc_reporting import (
     print_header,
-    print_uc_header,
     print_result,
-    print_uc_result,
     summarize,
-    summarize_uc,
     save_tsv,
-    save_uc_tsv,
     _write_eval_done,
     _write_train_done,
 )
 from ntc_checkpointing import (
     _bc_ckpt_path,
-    _append_uc_psnr,
+    _uc_ckpt_path,
     _restore_model_params_from_ckpt,
-    _prepare_train_ckpt,
+    _timestamp,
+    _write_config_yaml,
 )
 
 
-def _model_set_inference_channels(self, channels=None, ref_dim=9):
-    names = _normalize_channel_names(channels)
-    if names is None:
-        names = _default_inference_channels(getattr(self, 'output_dim', 9), ref_dim=ref_dim)
-    self.inference_channels = names
-    self.inference_channel_indices = _channel_indices(names, ref_dim=ref_dim)
-    return names
-
-
-def _model_get_inference_channels(self):
-    names = _normalize_channel_names(getattr(self, 'inference_channels', None))
-    if names is None:
-        names = self.set_inference_channels()
-    return names
-
-
-def _compute_bc_storage_bits(model, mlp_param_bits=16):
-    total_bits = 0
-    for grid in model.feature_grids:
-        for mip in grid.mips:
-            fmt = mip.bc_format
-            C = mip.feature_dim
-            num_eps = fmt.get_endpoint_count()
-            sum_eps_bits = sum(fmt.get_endpoint_bits(C))
-            idx_bits = fmt.get_index_bits()
-            block_bits = num_eps * sum_eps_bits + 16 * idx_bits
-            total_bits += mip.blocks_h * mip.blocks_w * block_bits
-
-    mlp_params = sum(p.numel() for p in model.mlp.parameters())
-    return total_bits + mlp_params * mlp_param_bits
-
-
-def _model_compute_storage_bits(self, mlp_param_bits=16):
-    return _compute_bc_storage_bits(self, mlp_param_bits=mlp_param_bits)
-
-
-def _model_compute_reference_bits(self, dataset_root, material_name):
-    return get_png_bytes(dataset_root, material_name) * 8
-
-
-def _model_compute_compression_stats(self, dataset_root, material_name, mlp_param_bits=16):
-    bc_bits = self.compute_storage_bits(mlp_param_bits=mlp_param_bits)
-    png_bits = self.compute_reference_bits(dataset_root, material_name)
-    return {
-        'bc_bits': bc_bits,
-        'png_bits': png_bits,
-        'compression_ratio': round(bc_bits / max(png_bits, 1), 4),
-    }
-
-
-def _attach_model_interfaces(model, inference_channels=None, ref_dim=9):
-    """把通道记录、benchmark、压缩统计挂到模型实例上。"""
-    if not hasattr(model, 'set_inference_channels'):
-        model.set_inference_channels = types.MethodType(_model_set_inference_channels, model)
-    if not hasattr(model, 'get_inference_channels'):
-        model.get_inference_channels = types.MethodType(_model_get_inference_channels, model)
-    if not hasattr(model, 'compute_storage_bits'):
-        model.compute_storage_bits = types.MethodType(_model_compute_storage_bits, model)
-    if not hasattr(model, 'compute_reference_bits'):
-        model.compute_reference_bits = types.MethodType(_model_compute_reference_bits, model)
-    if not hasattr(model, 'compute_compression_stats'):
-        model.compute_compression_stats = types.MethodType(_model_compute_compression_stats, model)
-    model.set_inference_channels(inference_channels, ref_dim=ref_dim)
-    return model
-
-
 # ============================================================
-# UC 训练 / 加载
+# UV + LOD 采样
 # ============================================================
 
 def _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device, max_useful_lod=None):
@@ -128,164 +55,119 @@ def _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device, max_useful_lod
     return uv, scale
 
 
-def train_and_save_uc(ref_mips, output_dim, model_params, uc_params, device, save_path):
-    model = _attach_model_interfaces(make_model(model_params, output_dim=output_dim).to(device), ref_dim=output_dim)
-    ref_mips = [m.to(device) for m in ref_mips]
+# ============================================================
+# 统一训练 / 加载 (UC / BC / BC-MLP)
+# ============================================================
+
+def _make_train_model(mode, model_params, output_dim, bc_format_name, device):
+    if mode == 'train-uc':
+        model = make_model(model_params, output_dim=output_dim)
+    else:
+        model = make_bc_model(model_params, output_dim=output_dim,
+                              bc_format_name=bc_format_name)
+    model = model.to(device)
+    if hasattr(model, 'set_inference_channels'):
+        model.set_inference_channels(ref_dim=output_dim)
+    return model
+
+
+def _load_state_dict_into(model, ckpt_path, device):
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    state = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
+    model.load_state_dict(state)
+    return model
+
+
+def _load_model(mode, save_path, model_params, output_dim, bc_format_name, device):
+    model = _make_train_model(mode, model_params, output_dim, bc_format_name, device)
+    _load_state_dict_into(model, save_path, device)
+    model.eval()
+    return model
+
+
+def _make_train_optimizer(model, mode, train_params):
+    feat_params = list(model.feature_grids.parameters())
+    mlp_params = list(model.mlp.parameters())
+    betas = tuple(train_params.get('betas', [0.9, 0.999]))
+
+    if mode == 'train-bc-mlp':
+        # finetune 阶段冻结 feature, 仅优化 MLP.
+        for p in feat_params:
+            p.requires_grad = False
+        return torch.optim.Adam(mlp_params, lr=train_params['lr_mlp'], betas=betas)
+
+    return torch.optim.Adam([
+        {'params': feat_params, 'lr': train_params['lr_feat']},
+        {'params': mlp_params, 'lr': train_params['lr_mlp']},
+    ], betas=betas)
+
+
+def _run_training_loop(model, ref_mips, device, optimizer, loss_fn,
+                       total_iterations, batch_res, gamma=1.0,
+                       loss_channels=None, max_useful_lod=None,
+                       save_path=None, save_interval=None):
     num_mips = len(ref_mips)
     ref_h, ref_w = ref_mips[0].shape[1], ref_mips[0].shape[2]
-
-    optimizer = torch.optim.Adam([
-        {'params': list(model.feature_grids.parameters()), 'lr': uc_params['lr_feat']},
-        {'params': list(model.mlp.parameters()), 'lr': uc_params['lr_mlp']},
-    ])
-    gamma = uc_params['gamma']
-    iterations = uc_params['total_iterations']
-    batch_res = uc_params['batch_res']
-    # GT 滤波永远走 bicubic (论文 Sec 5.1), 与神经特征端的 trilinear 解耦.
-    # model.filter 仅作用于神经特征采样 (硬件 sampler 模拟), 不影响 GT.
     gt_filter = 'bicubic'
-    loss_channels = uc_params.get('loss_channels', None)
-    max_useful_lod = uc_params.get('max_useful_lod', None)
+    do_periodic_save = save_path is not None and save_interval is not None
 
-    for it in range(iterations):
+    loss_total = 0.0
+    for it in range(total_iterations):
         model.train()
         uv, scale = _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device, max_useful_lod)
-
         with torch.no_grad():
             ref = sample_reference(ref_mips, uv, scale, gt_filter)
         pred = model(uv, scale)
         if loss_channels is not None:
             pred = pred[:, loss_channels, :, :]
             ref = ref[:, loss_channels, :, :]
-        loss = F.mse_loss(pred, ref)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        for pg in optimizer.param_groups:
-            pg['lr'] *= gamma
-
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    torch.save(model.state_dict(), save_path)
-    return model
-
-
-def load_uc(save_path, model_params, output_dim, device):
-    model = _attach_model_interfaces(make_model(model_params, output_dim=output_dim).to(device), ref_dim=output_dim)
-    model.load_state_dict(torch.load(save_path, map_location=device))
-    model.eval()
-    return model
-
-
-# ============================================================
-# BC 训练 / 加载
-# ============================================================
-
-def train_and_save_bc(ref_mips, output_dim, model_params, bc_format_name, bc_params, device, save_path):
-    bc_model = train_bc_model(ref_mips, output_dim, model_params, bc_format_name, bc_params, device)
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    torch.save({'model_state_dict': bc_model.state_dict()}, save_path)
-    return bc_model
-
-
-def load_bc(save_path, model_params, output_dim, bc_format_name, device):
-    bc_model = make_bc_model(model_params, output_dim=output_dim,
-                             bc_format_name=bc_format_name).to(device)
-    _attach_model_interfaces(bc_model, ref_dim=output_dim)
-    ckpt = torch.load(save_path, map_location=device, weights_only=False)
-    state = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
-    bc_model.load_state_dict(state)
-    bc_model.eval()
-    return bc_model
-
-def train_bc_model(ref_mips, output_dim, model_params, bc_format_name, bc_params, device):
-    bc_model = make_bc_model(model_params, output_dim=output_dim,
-                             bc_format_name=bc_format_name).to(device)
-    _attach_model_interfaces(bc_model, ref_dim=output_dim)
-    ref_mips = [m.to(device) for m in ref_mips]
-    num_mips = len(ref_mips)
-    ref_h, ref_w = ref_mips[0].shape[1], ref_mips[0].shape[2]
-
-    feat_params = []
-    for grid in bc_model.feature_grids:
-        for mip in grid.mips:
-            feat_params.append(mip.endpoints)
-            feat_params.append(mip.raw_indices)
-
-    optimizer = torch.optim.Adam([
-        {'params': feat_params, 'lr': bc_params['lr_feat']},
-        {'params': list(bc_model.mlp.parameters()), 'lr': bc_params['lr_mlp']},
-    ], betas=tuple(bc_params['betas']))
-
-    iterations = bc_params['total_iterations']
-    batch_res = bc_params['batch_res']
-    loss_fn = bc_params['loss_fn']
-    # GT 滤波永远走 bicubic (论文 Sec 5.1), 与神经特征端的 trilinear 解耦.
-    gt_filter = 'bicubic'
-    gamma = bc_params.get('gamma', 1.0)
-    loss_channels = bc_params.get('loss_channels', None)
-    max_useful_lod = bc_params.get('max_useful_lod', None)
-
-    for it in range(iterations):
-        bc_model.train()
-        uv, scale = _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device, max_useful_lod)
-
-        with torch.no_grad():
-            ref = sample_reference(ref_mips, uv, scale, gt_filter)
-        pred = bc_model(uv, scale)
-        if loss_channels is not None:
-            pred = pred[:, loss_channels, :, :]
-            ref = ref[:, loss_channels, :, :]
         loss = F.l1_loss(pred, ref) if loss_fn == 'l1' else F.mse_loss(pred, ref)
-
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        loss_total += loss.item()
         if gamma < 1.0:
             for pg in optimizer.param_groups:
                 pg['lr'] *= gamma
+        step = it + 1
+        if do_periodic_save and step != total_iterations and step % save_interval == 0:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            torch.save({'model_state_dict': model.state_dict()}, save_path)
+    return model, loss_total / total_iterations
 
-    # ----------------------------------------------------------------
-    # 第三阶段 (论文 Sec 6.2): 冻结 BC features, finetune MLP.
-    # 此时 _quantize_ste 在 train()/eval() 下都返回硬量化值, MLP 适应
-    # 真正的离散特征分布, 修复"训练-导出"行为不一致.
-    # ----------------------------------------------------------------
-    finetune_iters = bc_params.get('mlp_finetune_iterations', 0)
-    if finetune_iters and finetune_iters > 0:
-        for p in feat_params:
-            p.requires_grad_(False)
 
-        ft_lr = bc_params.get('mlp_finetune_lr', bc_params['lr_mlp'])
-        ft_gamma = bc_params.get('mlp_finetune_gamma', 1.0)
-        ft_optimizer = torch.optim.Adam(
-            list(bc_model.mlp.parameters()),
-            lr=ft_lr, betas=tuple(bc_params['betas']),
-        )
+def _train_and_save_model(mode, ref_mips, output_dim, model_params, bc_format_name,
+                          train_params, device, save_path,
+                          init_from_uc_model=None, existing_model=None,
+                          save_interval=None):
+    """构建/复用模型并训练.
 
-        for it in range(finetune_iters):
-            bc_model.train()
-            uv, scale = _sample_uv_and_lod(ref_h, ref_w, batch_res, num_mips, device, max_useful_lod)
+    - mode='train-uc': 从零构建.
+    - 传 init_from_uc_model: 用 UC 模型初始化 BC 端点/索引/MLP.
+    - 传 existing_model: 复用已有模型继续训练 (BC-MLP finetune).
+    """
+    if existing_model is not None:
+        model = existing_model
+    else:
+        model = _make_train_model(mode, model_params, output_dim, bc_format_name, device)
+        if init_from_uc_model is not None:
+            model.init_from_uc(init_from_uc_model)
 
-            with torch.no_grad():
-                ref = sample_reference(ref_mips, uv, scale, gt_filter)
-            pred = bc_model(uv, scale)
-            if loss_channels is not None:
-                pred = pred[:, loss_channels, :, :]
-                ref = ref[:, loss_channels, :, :]
-            loss = F.l1_loss(pred, ref) if loss_fn == 'l1' else F.mse_loss(pred, ref)
-
-            ft_optimizer.zero_grad()
-            loss.backward()
-            ft_optimizer.step()
-            if ft_gamma < 1.0:
-                for pg in ft_optimizer.param_groups:
-                    pg['lr'] *= ft_gamma
-
-        # 恢复 requires_grad 状态, 避免影响后续二次训练 / 重载.
-        for p in feat_params:
-            p.requires_grad_(True)
-
-    return bc_model
+    ref_mips = [m.to(device) for m in ref_mips]
+    optimizer = _make_train_optimizer(model, mode, train_params)
+    loss_fn = train_params.get('loss_fn', 'mse')
+    model, train_loss = _run_training_loop(
+        model, ref_mips, device, optimizer, loss_fn,
+        train_params['total_iterations'], train_params['batch_res'],
+        gamma=train_params.get('gamma', 1.0),
+        loss_channels=train_params.get('loss_channels'),
+        max_useful_lod=train_params.get('max_useful_lod'),
+        save_path=save_path, save_interval=save_interval,
+    )
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        torch.save({'model_state_dict': model.state_dict()}, save_path)
+    return model, train_loss
 
 
 # ============================================================
@@ -318,105 +200,10 @@ def benchmark_inference_ms(bc_model, ref_h, ref_w, device, warmup_iters=5, timin
     return (elapsed / timing_iters) * 1000.0
 
 
-@torch.no_grad()
-def _evaluate_full_loss(model, ref_mips, device, loss_fn='mse', max_res=256):
-    losses = []
-    model.eval()
-
-    for mip_i, ref_mip in enumerate(ref_mips):
-        ref_mip = ref_mip.to(device)
-        h, w = ref_mip.shape[1], ref_mip.shape[2]
-
-        if h <= max_res and w <= max_res:
-            u = torch.linspace(0, 1, w, device=device)
-            v = torch.linspace(0, 1, h, device=device)
-            uv = torch.stack(torch.meshgrid(u, v, indexing='xy'), dim=-1).unsqueeze(0)
-            scale = torch.tensor([float(mip_i)], device=device)
-            pred = model(uv, scale)
-            loss = F.l1_loss(pred, ref_mip.unsqueeze(0)) if loss_fn == 'l1' else F.mse_loss(pred, ref_mip.unsqueeze(0))
-        else:
-            loss_total = 0.0
-            count = 0
-            for ty in range(0, h, max_res):
-                th = min(max_res, h - ty)
-                for tx in range(0, w, max_res):
-                    tw = min(max_res, w - tx)
-                    u = torch.linspace(tx / w, (tx + tw) / w, tw, device=device)
-                    v = torch.linspace(ty / h, (ty + th) / h, th, device=device)
-                    uv = torch.stack(torch.meshgrid(u, v, indexing='xy'), dim=-1).unsqueeze(0)
-                    scale = torch.tensor([float(mip_i)], device=device)
-                    pred = model(uv, scale)
-                    ref_tile = ref_mip[:, ty:ty + th, tx:tx + tw].unsqueeze(0)
-                    tile_loss = F.l1_loss(pred, ref_tile) if loss_fn == 'l1' else F.mse_loss(pred, ref_tile)
-                    loss_total += tile_loss.item() * th * tw
-                    count += th * tw
-            loss = loss_total / count
-        losses.append(loss.item() if hasattr(loss, 'item') else loss)
-
-    model.train()
-    return sum(losses) / len(losses)
-
-
-def compute_bc_bits(bc_model, mlp_param_bits=16):
-    if hasattr(bc_model, 'compute_storage_bits'):
-        return bc_model.compute_storage_bits(mlp_param_bits=mlp_param_bits)
-    return _compute_bc_storage_bits(bc_model, mlp_param_bits=mlp_param_bits)
-
-
-def get_png_bytes(dataset_root, material_name):
-    mdir = os.path.join(dataset_root, material_name)
-    total = 0
-    for fname in os.listdir(mdir):
-        if fname.endswith('.png'):
-            total += os.path.getsize(os.path.join(mdir, fname))
-    return total
-
 
 # ============================================================
 # 单材质评估
 # ============================================================
-
-def get_or_compute_uc_psnr(name, mipmaps, model_params, output_dim, device, ckpt_dir):
-    """加载 UC 模型并在传入 mipmaps 分辨率上计算 psnr_uc（不缓存，因为 eval 在 2K 上）。"""
-    uc_path = os.path.join(ckpt_dir, f'{name}.pth')
-    if not os.path.exists(uc_path):
-        return None
-    uc_model = load_uc(uc_path, model_params, output_dim, device)
-    mips_gpu = [m.to(device) for m in mipmaps]
-    psnr_uc, _ = evaluate_full(uc_model, mips_gpu, device)
-    del uc_model
-    torch.cuda.empty_cache()
-    return psnr_uc
-
-
-def evaluate_uc_one(name, mipmaps, model_params, device, ckpt_dir):
-    output_dim = mipmaps[0].shape[0]
-    ref_h, ref_w = mipmaps[0].shape[1], mipmaps[0].shape[2]
-    t0 = time.time()
-
-    uc_path = os.path.join(ckpt_dir, f'{name}.pth')
-    if not os.path.exists(uc_path):
-        raise FileNotFoundError(
-            f"UC checkpoint not found: {uc_path}\n"
-            f"Please run: python Tool.py --config <yaml> --train-uc --ckpt {ckpt_dir}"
-        )
-
-    uc_model = load_uc(uc_path, model_params, output_dim, device)
-    mips_gpu = [m.to(device) for m in mipmaps]
-    psnr_uc, eval_loss = evaluate_full(uc_model, mips_gpu, device)
-    _append_uc_psnr(ckpt_dir, name, psnr_uc)
-    del uc_model
-    torch.cuda.empty_cache()
-
-    return {
-        'name': name,
-        'channels': output_dim,
-        'resolution': f'{ref_h}x{ref_w}',
-        'psnr_ori': round(psnr_uc, 2),
-        'eval_loss': round(eval_loss, 8),
-        'time_total': round(time.time() - t0, 1),
-    }
-
 
 def evaluate_one(name, mipmaps, model_params, bc_format_name, device, ckpt_dir,
                  dataset_root, bench_params, vis_dir=None):
@@ -426,27 +213,22 @@ def evaluate_one(name, mipmaps, model_params, bc_format_name, device, ckpt_dir,
 
     results = {'name': name, 'channels': output_dim, 'resolution': f'{ref_h}x{ref_w}'}
 
-    # 原图质量参考：加载 UC（全精度）模型，计算其对原图的 PSNR
-    psnr_uc = get_or_compute_uc_psnr(name, mipmaps, model_params, output_dim, device, ckpt_dir)
-    if psnr_uc is not None:
-        results['psnr_ori'] = round(psnr_uc, 2)
+    psnr_bc_ref = compute_traditional_bc_psnr(mipmaps[0], bc_format=bc_format_name)
+    results['psnr_bc_ref'] = round(psnr_bc_ref, 2)
 
     bc_path = _bc_ckpt_path(ckpt_dir, bc_format_name, name)
     if not os.path.exists(bc_path):
         raise FileNotFoundError(
             f"BC checkpoint not found: {bc_path}\n"
-            f"Please run: python Tool.py --config <yaml> --train-bc --ckpt {ckpt_dir}"
+            f"Please run: python Tool.py --config <yaml> --train --ckpt {ckpt_dir}"
         )
-    bc_model = load_bc(bc_path, model_params, output_dim, bc_format_name, device)
+    bc_model = _load_model('eval', bc_path, model_params, output_dim, bc_format_name, device)
 
     mips_gpu = [m.to(device) for m in mipmaps]
     psnr_bc, _ = evaluate_full(bc_model, mips_gpu, device)
     results['psnr_bc'] = round(psnr_bc, 2)
-    # 原图 → BC 的质量 drop
-    if psnr_uc is not None:
-        results['psnr_drop'] = round(psnr_uc - psnr_bc, 2)
+    results['psnr_drop'] = round(psnr_bc_ref - psnr_bc, 2)
 
-    # --- 推理时间 ---
     inf_ms = benchmark_inference_ms(
         bc_model, ref_h, ref_w, device,
         warmup_iters=bench_params['warmup_iters'],
@@ -454,12 +236,10 @@ def evaluate_one(name, mipmaps, model_params, bc_format_name, device, ckpt_dir,
     )
     results['inference_ms'] = round(inf_ms, 3)
 
-    # --- 压缩率 ---
     results.update(bc_model.compute_compression_stats(
         dataset_root, name, mlp_param_bits=bench_params['mlp_param_bits']
     ))
 
-    # --- 可视化 ---
     if vis_dir is not None:
         os.makedirs(vis_dir, exist_ok=True)
         vis_path = os.path.join(vis_dir, f'{name}.png')
@@ -480,7 +260,9 @@ def evaluate_one(name, mipmaps, model_params, bc_format_name, device, ckpt_dir,
 
 
 def _train_one_material(mode, name, sample, model_params, train_params,
-                        bc_format_name, device, ckpt_dir):
+                        bc_format_name, device, ckpt_dir,
+                        init_from_uc_model=None, existing_model=None):
+    """单材质单阶段训练. 返回 (result_dict, model). 调用方负责释放 model."""
     mipmaps = [m.cpu() for m in sample['mipmaps']]
     output_dim = sample['ref_tensor'].shape[0]
     model = None
@@ -488,19 +270,22 @@ def _train_one_material(mode, name, sample, model_params, train_params,
 
     try:
         if mode == 'train-uc':
-            save_path = os.path.join(ckpt_dir, f'{name}.pth')
-            model = train_and_save_uc(mipmaps, output_dim, model_params,
-                                      train_params, device, save_path)
-            mips_gpu = [m.to(device) for m in mipmaps]
-            metric, train_loss = evaluate_full(model, mips_gpu, device)
-            _append_uc_psnr(ckpt_dir, name, metric)
-        else:
+            save_path = None
+            save_interval = None
+        elif mode == 'train-bc-mlp':
+            save_path = os.path.join(ckpt_dir, f'bc_{bc_format_name}_mlp', f'{name}.pth')
+            save_interval = None
+        else:  # train-bc
             save_path = _bc_ckpt_path(ckpt_dir, bc_format_name, name)
-            model = train_and_save_bc(mipmaps, output_dim, model_params,
-                                      bc_format_name, train_params, device, save_path)
-            mips_gpu = [m.to(device) for m in mipmaps]
-            metric, _ = evaluate_full(model, mips_gpu, device)
-            train_loss = _evaluate_full_loss(model, mips_gpu, device, train_params['loss_fn'])
+            save_interval = 10000
+
+        model, train_loss = _train_and_save_model(
+            mode, mipmaps, output_dim, model_params,
+            bc_format_name, train_params, device, save_path,
+            init_from_uc_model=init_from_uc_model,
+            existing_model=existing_model,
+            save_interval=save_interval,
+        )
     finally:
         elapsed = time.time() - t0
 
@@ -509,111 +294,54 @@ def _train_one_material(mode, name, sample, model_params, train_params,
         'train_loss': train_loss,
         'time_total': elapsed,
     }
-    if model is not None:
-        del model
+    return result, model
+
+
+def _run_pipeline_one_material(name, sample, model_params, uc_params, bc_params, mlp_params,
+                               bc_format_name, device, ckpt_dir, prefix=''):
+    """单材质 UC → BC → BC-MLP 三阶段串行, 模型在内存中传递."""
+    uc_result, uc_model = _train_one_material(
+        'train-uc', name, sample, model_params, uc_params,
+        bc_format_name, device, ckpt_dir,
+    )
+
+    bc_result, bc_model = _train_one_material(
+        'train-bc', name, sample, model_params, bc_params,
+        bc_format_name, device, ckpt_dir,
+        init_from_uc_model=uc_model,
+    )
+    del uc_model
     torch.cuda.empty_cache()
-    return result, metric
+
+    mlp_result, mlp_model = _train_one_material(
+        'train-bc-mlp', name, sample, model_params, mlp_params,
+        bc_format_name, device, ckpt_dir,
+        existing_model=bc_model,
+    )
+    del bc_model, mlp_model
+    torch.cuda.empty_cache()
+
+    total_t = uc_result['time_total'] + bc_result['time_total'] + mlp_result['time_total']
+    print(f"{prefix}{name:<30s}  UC {uc_result['train_loss']:>6.4f}  "
+          f"BC {bc_result['train_loss']:>6.4f}  MLP {mlp_result['train_loss']:>6.4f}  "
+          f"{total_t:>6.1f}s",
+          flush=True)
+    return uc_result, bc_result, mlp_result
 
 
-def _run_train_materials(mode, names, ds, model_params, train_params,
-                         bc_format_name, device, ckpt_dir, prefix=''):
-    results = []
+def _run_pipeline_materials(names, ds, model_params, uc_params, bc_params, mlp_params,
+                            bc_format_name, device, ckpt_dir, prefix=''):
+    uc_results, bc_results, mlp_results = [], [], []
     for i, name in enumerate(names):
         sample = ds.get_by_name(name)
-        result, metric = _train_one_material(
-            mode, name, sample, model_params, train_params,
-            bc_format_name, device, ckpt_dir,
+        ur, br, mr = _run_pipeline_one_material(
+            name, sample, model_params, uc_params, bc_params, mlp_params,
+            bc_format_name, device, ckpt_dir, prefix=f"{prefix}[{i+1:>2d}/{len(names)}] ",
         )
-        results.append(result)
-        metric_str = f"BC {metric:>7.2f}" if mode == 'train-bc' else f"{metric:>7.2f}"
-        print(f"{prefix}[{i+1:>2d}/{len(names)}] {name:<30s} {metric_str} {result['time_total']:>5.1f}s", flush=True)
-    return results
-
-
-def _run_mp_train(mode, gpu_ids, names_split, config_path, ckpt_dir, num_workers):
-    import torch.multiprocessing as mp
-    mp.set_start_method('spawn', force=True)
-    task_args = [
-        (mode, gpu_ids[i % len(gpu_ids)], names_split[i], config_path, ckpt_dir)
-        for i in range(num_workers)
-    ]
-    with mp.Pool(num_workers) as pool:
-        worker_results = pool.map(_mp_train_worker, task_args)
-
-    train_results = []
-    for wr in worker_results:
-        train_results.extend(wr)
-    return train_results
-
-
-def _print_train_header(mode, train_params, bc_format_name, ckpt_dir,
-                        num_workers, gpu_ids):
-    if mode == 'train-uc':
-        print(f"=== Train UC ({train_params['total_iterations']} iters, {num_workers} workers, GPUs={gpu_ids}) ===")
-        print(f"Checkpoints → {ckpt_dir}/")
-        print(f"{'Material':<30s} {'PSNR':>7s} {'Time':>6s}")
-        print('-' * 47)
-    else:
-        print(f"=== Train BC ({bc_format_name.upper()}, {train_params['total_iterations']} iters, "
-              f"{num_workers} workers, GPUs={gpu_ids}) ===")
-        print(f"Checkpoints → {ckpt_dir}/bc_{bc_format_name}/")
-        print(f"{'Material':<30s} {'BC PSNR':>7s} {'Time':>6s}")
-        print('-' * 49)
-
-
-def _run_uc_eval(names, ds, model_params, device, ckpt_dir, prefix=''):
-    all_results = []
-    for i, name in enumerate(names):
-        sample = ds.get_by_name(name)
-        mipmaps = [m.cpu() for m in sample['mipmaps']]
-        try:
-            r = evaluate_uc_one(name, mipmaps, model_params, device, ckpt_dir)
-            all_results.append(r)
-            print(f"{prefix}[{i+1:>2d}/{len(names)}] ", end='', flush=True)
-            print_uc_result(r)
-        except FileNotFoundError as e:
-            print(f"{prefix}SKIP {name}: {e}", flush=True)
-        except Exception as e:
-            print(f"{prefix}ERROR on {name}: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
-    return all_results
-
-
-def _run_eval_uc_stage(names, ds, model_params, device, ckpt_dir,
-                       config_path, bc_format_name, num_workers,
-                       use_mp=False, gpu_ids=None, names_split=None,
-                       write_done=True):
-    params_label = f"UC fl={model_params.get('filter')}"
-    print(f"\n{'='*80}")
-    print(f"Eval UC  |  {params_label}")
-    print(f"Checkpoints from {ckpt_dir}")
-    print(f"{'='*80}")
-    print_uc_header()
-
-    if use_mp:
-        import torch.multiprocessing as mp
-        mp.set_start_method('spawn', force=True)
-        task_args = [
-            (gpu_ids[i % len(gpu_ids)], names_split[i], config_path, ckpt_dir)
-            for i in range(num_workers)
-        ]
-        with mp.Pool(num_workers) as pool:
-            worker_results = pool.map(_mp_eval_uc_worker, task_args)
-        all_results = []
-        for wr in worker_results:
-            all_results.extend(wr)
-    else:
-        all_results = _run_uc_eval(names, ds, model_params, device, ckpt_dir)
-
-    if all_results:
-        summarize_uc(all_results, params_label)
-        cfg_stem = os.path.splitext(os.path.basename(config_path))[0]
-        save_uc_tsv(all_results, ckpt_dir, cfg_stem)
-
-    if write_done:
-        _write_eval_done('eval-uc', ckpt_dir, config_path, bc_format_name, num_workers, all_results)
-    return all_results
+        uc_results.append(ur)
+        bc_results.append(br)
+        mlp_results.append(mr)
+    return uc_results, bc_results, mlp_results
 
 
 # ============================================================
@@ -628,26 +356,42 @@ def _make_dataset(dataset_params, target_res):
     )
 
 
-def _mp_train_worker(args):
-    """多进程训练 worker."""
-    mode, gpu_id, names, config_path, ckpt_dir = args
+def _mp_pipeline_worker(args):
+    """多进程 worker: 分到的材质串行跑完整 UC→BC→BC-MLP 流水线."""
+    gpu_id, names, config_path, ckpt_dir = args
     device = f'cuda:{gpu_id}'
     torch.cuda.set_device(device)
 
     config = load_config(config_path)
     bc_format_name = config['bc_format']
     model_params = get_model_params(config)
-    train_params = get_uc_training_params(config) if mode == 'train-uc' else get_bc_training_params(config)
+    uc_params = get_uc_training_params(config)
+    bc_params = get_bc_training_params(config)
+    mlp_params = get_bc_mlp_training_params(config)
     dataset_params = get_dataset_params(config)
 
-    if mode == 'train-bc':
-        _restore_model_params_from_ckpt(ckpt_dir, model_params)
-
     ds = _make_dataset(dataset_params, dataset_params['target_res'])
-    return _run_train_materials(
-        mode, names, ds, model_params, train_params,
+    return _run_pipeline_materials(
+        names, ds, model_params, uc_params, bc_params, mlp_params,
         bc_format_name, device, ckpt_dir, prefix=f"[{gpu_id}] ",
     )
+
+
+def _run_mp_pipeline(gpu_ids, names_split, config_path, ckpt_dir, num_workers):
+    import torch.multiprocessing as mp
+    mp.set_start_method('spawn', force=True)
+    task_args = [
+        (gpu_ids[i % len(gpu_ids)], names_split[i], config_path, ckpt_dir)
+        for i in range(num_workers)
+    ]
+    with mp.Pool(num_workers) as pool:
+        worker_results = pool.map(_mp_pipeline_worker, task_args)
+    uc_all, bc_all, mlp_all = [], [], []
+    for ur, br, mr in worker_results:
+        uc_all.extend(ur)
+        bc_all.extend(br)
+        mlp_all.extend(mr)
+    return uc_all, bc_all, mlp_all
 
 
 def _mp_eval_worker(args):
@@ -689,19 +433,62 @@ def _mp_eval_worker(args):
     return all_results
 
 
-def _mp_eval_uc_worker(args):
-    """多进程 UC eval worker."""
-    gpu_id, names, config_path, ckpt_dir = args
-    device = f'cuda:{gpu_id}'
-    torch.cuda.set_device(device)
+# ============================================================
+# 一键训练流水线: UC → BC → BC-MLP
+# ============================================================
 
+def pipeline_train(config_path, ckpt=None, materials=None, num_workers=1, gpus=None):
     config = load_config(config_path)
+    bc_format_name = config['bc_format']
     model_params = get_model_params(config)
+    uc_params = get_uc_training_params(config)
+    bc_params = get_bc_training_params(config)
+    mlp_params = get_bc_mlp_training_params(config)
     dataset_params = get_dataset_params(config)
-    _restore_model_params_from_ckpt(ckpt_dir, model_params)
 
-    ds = _make_dataset(dataset_params, target_res=None)
-    return _run_uc_eval(names, ds, model_params, device, ckpt_dir, prefix=f"[{gpu_id}] ")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    ds = _make_dataset(dataset_params, dataset_params['target_res'])
+    names = materials if materials else ds.material_names
+
+    gpu_ids = gpus if gpus else [0]
+    use_mp = num_workers > 1 and device == 'cuda'
+
+    names_split = [[] for _ in range(num_workers)]
+    for i, name in enumerate(names):
+        names_split[i % num_workers].append(name)
+
+    ckpt_dir = ckpt if ckpt is not None else os.path.join('checkpoints', _timestamp())
+    os.makedirs(ckpt_dir, exist_ok=True)
+    _write_config_yaml(ckpt_dir, config)
+
+    print(f"Device: {device}  |  Config: {config_path}  |  BC: {bc_format_name.upper()}")
+    print(f"Checkpoints → {ckpt_dir}/  |  workers={num_workers}, GPUs={gpu_ids}")
+    print(f"Iters: UC={uc_params['total_iterations']}  "
+          f"BC={bc_params['total_iterations']}  MLP={mlp_params['total_iterations']}")
+    print(f"Loaded {len(ds)} materials. Each material: UC → BC → BC-MLP (in-memory handoff).\n")
+    print('=' * 78)
+    print(f"{'Material':<30s}  {'UC':>7s}  {'BC':>7s}  {'MLP':>7s}  {'Time':>6s}")
+    print('=' * 78)
+
+    if use_mp:
+        uc_results, bc_results, mlp_results = _run_mp_pipeline(
+            gpu_ids, names_split, config_path, ckpt_dir, num_workers,
+        )
+    else:
+        uc_results, bc_results, mlp_results = _run_pipeline_materials(
+            names, ds, model_params, uc_params, bc_params, mlp_params,
+            bc_format_name, device, ckpt_dir,
+        )
+
+    _write_train_done('train-uc', ckpt_dir, config_path, bc_format_name, num_workers, uc_results)
+    _write_train_done('train-bc', ckpt_dir, config_path, bc_format_name, num_workers, bc_results)
+    _write_train_done('train-bc-mlp', ckpt_dir, config_path, bc_format_name, num_workers, mlp_results)
+
+    print(f"\n{'='*60}")
+    print(f"Pipeline complete.  {len(uc_results)} materials × (UC → BC → BC-MLP)")
+    print(f"Next: python Tool.py --config {config_path} --ckpt {ckpt_dir}/")
+    print(f"{'='*60}")
+    return ckpt_dir
 
 
 # ============================================================
@@ -712,14 +499,10 @@ def main():
     parser = argparse.ArgumentParser(description='NTC: Neural Texture Compression')
     parser.add_argument('--config', type=str, required=True,
                         help='实验 yaml 配置文件路径 (必需)')
-    parser.add_argument('--train-uc', action='store_true',
-                        help='训练并保存 UC (无约束) 基线模型')
-    parser.add_argument('--train-bc', action='store_true',
-                        help='训练并保存 BC 压缩模型')
-    parser.add_argument('--eval-uc', action='store_true',
-                        help='只评估 UC (无约束) 基线模型')
+    parser.add_argument('--train', action='store_true',
+                        help='一键流水线: UC → BC → BC-MLP')
     parser.add_argument('--ckpt', type=str, default=None,
-                        help='checkpoint 目录 (--train-bc 可选, eval 必需)')
+                        help='checkpoint 目录 (eval 必需)')
     parser.add_argument('--materials', type=str, default=None,
                         help='逗号分隔的材质名, 默认全部')
     parser.add_argument('--vis-dir', type=str, default=None,
@@ -733,18 +516,15 @@ def main():
     config = load_config(args.config)
     bc_format_name = config['bc_format']
     model_params = get_model_params(config)
-    bc_params = get_bc_training_params(config)
     dataset_params = get_dataset_params(config)
     bench_params = get_benchmark_params(config)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     ds_root = dataset_params['root']
-    target_res = dataset_params['target_res']  # 论文对齐: 永远 None (原生分辨率)
 
-    ds = _make_dataset(dataset_params, target_res)
-    res_label = 'native' if target_res is None else str(target_res)
-    print(f"Device: {device}  |  Config: {args.config}  |  Res: {res_label}")
-    print(f"BC format: {bc_format_name.upper()}  |  Filter: {model_params.get('filter')} (feature)  |  GT filter: bicubic")
+    ds = _make_dataset(dataset_params, dataset_params['target_res'])
+    print(f"Device: {device}  |  Config: {args.config}  |  Res: native")
+    print(f"BC format: {bc_format_name.upper()}  |  Filter: {model_params.get('filter')}  |  GT filter: bicubic")
     print(f"Loaded {len(ds)} materials from {ds_root}\n")
 
     names = ([n.strip() for n in args.materials.split(',')]
@@ -764,83 +544,26 @@ def main():
     for i, name in enumerate(names):
         names_split[i % num_workers].append(name)
 
-    def _restore_model_params(ckpt_dir):
-        _restore_model_params_from_ckpt(ckpt_dir, model_params, verbose=True)
-
-    # ========================================================
-    # 阶段1: train-uc
-    # ========================================================
-    if args.train_uc:
-        uc_params = get_uc_training_params(config)
-        ckpt_dir = _prepare_train_ckpt('train-uc', args, config, model_params)
-        _print_train_header('train-uc', uc_params, bc_format_name, ckpt_dir, num_workers, gpu_ids)
-        if use_mp:
-            train_results = _run_mp_train('train-uc', gpu_ids, names_split, args.config, ckpt_dir, num_workers)
-        else:
-            train_results = _run_train_materials(
-                'train-uc', names, ds, model_params, uc_params,
-                bc_format_name, device, ckpt_dir,
-            )
-        print(f"\nDone. Trained {len(train_results)} materials.")
-        _write_train_done('train-uc', ckpt_dir, args.config, bc_format_name, num_workers, train_results)
-        
-        print(f"Next: python Tool.py --config {args.config} --train-bc --ckpt {ckpt_dir}/")
+    if args.train:
+        pipeline_train(args.config, ckpt=args.ckpt, materials=names,
+                       num_workers=num_workers, gpus=gpu_ids)
         return
 
-    # ========================================================
-    # 阶段2: train-bc
-    # ========================================================
-    if args.train_bc:
-        ckpt_dir = _prepare_train_ckpt('train-bc', args, config, model_params)
-        _print_train_header('train-bc', bc_params, bc_format_name, ckpt_dir, num_workers, gpu_ids)
-        if use_mp:
-            train_results = _run_mp_train('train-bc', gpu_ids, names_split, args.config, ckpt_dir, num_workers)
-        else:
-            train_results = _run_train_materials(
-                'train-bc', names, ds, model_params, bc_params,
-                bc_format_name, device, ckpt_dir,
-            )
-        print(f"\nDone. Trained {len(train_results)} BC models.")
-        _write_train_done('train-bc', ckpt_dir, args.config, bc_format_name, num_workers, train_results)
-        print(f"Next: python Tool.py --config {args.config} --ckpt {ckpt_dir}/")
-        return
-
-    # ========================================================
-    # 阶段3: eval-uc
-    # ========================================================
-    if args.eval_uc:
-        if not args.ckpt:
-            print("ERROR: eval-uc 模式需要 --ckpt <checkpoints/xxx/>")
-            sys.exit(1)
-        ckpt_dir = args.ckpt
-        _restore_model_params(ckpt_dir)
-        # Eval 在原生 2K 上进行（而非训练时的 target_res）。
-        ds = _make_dataset(dataset_params, target_res=None)
-        print(f"[eval-uc] Reloaded dataset at full (2K) resolution")
-        _run_eval_uc_stage(
-            names, ds, model_params, device, ckpt_dir, args.config,
-            bc_format_name, num_workers, use_mp=use_mp,
-            gpu_ids=gpu_ids, names_split=names_split,
-        )
-        return
-
-    # ========================================================
-    # 阶段4: eval
-    # ========================================================
     if not args.ckpt:
         print("ERROR: eval 模式需要 --ckpt <checkpoints/xxx/>")
         print("Usage:")
-        print("  python Tool.py --config <yaml> --train-bc")
-        print("  python Tool.py --config <yaml> --train-uc")
+        print("  python Tool.py --config <yaml> --train")
         print("  python Tool.py --config <yaml> --ckpt <dir/>")
         sys.exit(1)
 
     ckpt_dir = args.ckpt
-    _restore_model_params(ckpt_dir)
+    _restore_model_params_from_ckpt(ckpt_dir, model_params, verbose=True)
 
     # Eval 在原生 2K 上进行（而非训练时的 target_res）。
     ds = _make_dataset(dataset_params, target_res=None)
     print(f"[eval] Reloaded dataset at full (2K) resolution")
+
+    bc_params = get_bc_training_params(config)
 
     params_label = (
         f"BC={bc_format_name.upper()} fl={model_params.get('filter')} "

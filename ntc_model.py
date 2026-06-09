@@ -48,7 +48,8 @@ class MipmapFeatureGrid(nn.Module):
 
 
 class NeuralTextureModel(nn.Module):
-    def __init__(self, feature_configs, hidden_dim, output_dim, num_layers=2, filter_mode='trilinear'):
+    def __init__(self, feature_configs, hidden_dim, output_dim, num_layers=1,
+                 filter_mode='trilinear', output_activation='none'):
         super().__init__()
         self.feature_grids = nn.ModuleList([
             MipmapFeatureGrid(res, mips, dim, filter_mode)
@@ -58,11 +59,15 @@ class NeuralTextureModel(nn.Module):
 
         layers = []
         in_dim = total_input_dim
-        for i in range(num_layers - 1):
+        for i in range(num_layers):
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.ReLU())
             in_dim = hidden_dim
         layers.append(nn.Linear(in_dim, output_dim))
+        if output_activation == 'sigmoid':
+            layers.append(nn.Sigmoid())
+        elif output_activation == 'tanh':
+            layers.append(nn.Tanh())
         self.mlp = nn.Sequential(*layers)
 
         self.total_input_dim = total_input_dim
@@ -87,13 +92,14 @@ def make_model(model_params, output_dim=9):
 
     Args:
         model_params: dict, 由 get_model_params(config) 产生.
-            包含: feature_configs, hidden_dim, num_layers, filter
+            包含: feature_configs, hidden_dim, num_layers, filter, output_activation
         output_dim: MLP 输出维度
     """
     return NeuralTextureModel(
         feature_configs=model_params['feature_configs'],
         hidden_dim=model_params['hidden_dim'],
         output_dim=output_dim,
-        num_layers=model_params.get('num_layers', 2),
+        num_layers=model_params.get('num_layers', 1),
         filter_mode=model_params.get('filter', 'trilinear'),
+        output_activation=model_params.get('output_activation', 'none'),
     )

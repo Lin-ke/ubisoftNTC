@@ -2,14 +2,12 @@
 """一键启动 NTC 训练 / 评估。
 
 用法:
-    -- 训练全精度（默认后台）
-    python train_start.py --mode train-uc
-    -- 训练压缩；可恢复
-    python train_start.py --mode train-bc --ckpt checkpoints/xxx
+    -- 训练（默认后台）
+    python train_start.py --mode train
     -- 评估
     python train_start.py --mode eval --ckpt checkpoints/xxx
     # 前台阻塞运行
-    python train_start.py --mode train-uc --foreground
+    python train_start.py --mode train --foreground
 """
 import argparse
 import os
@@ -22,7 +20,6 @@ def detect_workers():
     try:
         import torch
         n = torch.cuda.device_count()
-        # 单卡显存很小，默认每卡 2 个 worker；如果检测不到 GPU 就用 1
         return max(1, n * 2)
     except Exception:
         return 1
@@ -30,7 +27,7 @@ def detect_workers():
 
 def main():
     parser = argparse.ArgumentParser(description='一键启动 NTC 训练/评估')
-    parser.add_argument('--mode', choices=['train-uc', 'train-bc', 'eval', 'eval-uc'], default='train-uc',
+    parser.add_argument('--mode', choices=['train', 'eval'], default='train',
                         help='运行模式')
     parser.add_argument('--config', default='configs/bc1_bcf05k.yaml',
                         help='YAML 配置文件路径')
@@ -50,13 +47,11 @@ def main():
                         help='前台运行（阻塞等待）')
     args = parser.parse_args()
 
-    if args.mode in ('eval', 'eval-uc') and not args.ckpt:
-        print(f'ERROR: {args.mode} 模式需要 --ckpt <checkpoint_dir>')
+    if args.mode == 'eval' and not args.ckpt:
+        print(f'ERROR: eval 模式需要 --ckpt <checkpoint_dir>')
         sys.exit(1)
 
-    # BC 训练 / eval 时，优先使用 checkpoint 目录下的 config.yaml，
-    # 以保证 UC 训练和 BC 训练使用相同的配置（loss、模型结构等）。
-    if args.mode in ('train-bc', 'eval', 'eval-uc') and args.ckpt:
+    if args.mode == 'eval' and args.ckpt:
         ckpt_config = os.path.join(args.ckpt, 'config.yaml')
         if os.path.exists(ckpt_config):
             if args.config == parser.get_default('config'):
@@ -76,15 +71,8 @@ def main():
            '--config', args.config,
            '--num-workers', str(workers)]
 
-    if args.mode == 'train-uc':
-        cmd.append('--train-uc')
-    elif args.mode == 'train-bc':
-        cmd.append('--train-bc')
-        if args.ckpt:
-            cmd.extend(['--ckpt', args.ckpt])
-    elif args.mode == 'eval-uc':
-        cmd.append('--eval-uc')
-        cmd.extend(['--ckpt', args.ckpt])
+    if args.mode == 'train':
+        cmd.append('--train')
     else:
         cmd.extend(['--ckpt', args.ckpt])
 
