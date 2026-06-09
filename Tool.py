@@ -71,6 +71,14 @@ def _make_train_model(mode, model_params, output_dim, bc_format_name, device):
     return model
 
 
+def _with_bc_quant(model_params, train_params):
+    """Attach BC-only quantization params without changing UC construction."""
+    params = dict(model_params)
+    if model_params.get('encoding', 'pyramid') == 'hash_grid':
+        params['hash_grid_quant'] = train_params.get('hash_grid_quant', {})
+    return params
+
+
 def _load_state_dict_into(model, ckpt_path, device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     state = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
@@ -149,7 +157,8 @@ def _train_and_save_model(mode, ref_mips, output_dim, model_params, bc_format_na
     if existing_model is not None:
         model = existing_model
     else:
-        model = _make_train_model(mode, model_params, output_dim, bc_format_name, device)
+        build_params = _with_bc_quant(model_params, train_params) if mode != 'train-uc' else model_params
+        model = _make_train_model(mode, build_params, output_dim, bc_format_name, device)
         if init_from_uc_model is not None:
             model.init_from_uc(init_from_uc_model)
 
@@ -222,7 +231,10 @@ def evaluate_one(name, mipmaps, model_params, bc_format_name, device, ckpt_dir,
             f"BC checkpoint not found: {bc_path}\n"
             f"Please run: python Tool.py --config <yaml> --train --ckpt {ckpt_dir}"
         )
-    bc_model = _load_model('eval', bc_path, model_params, output_dim, bc_format_name, device)
+    bc_train_params = get_bc_training_params(load_config(os.path.join(ckpt_dir, 'config.yaml'))) \
+        if os.path.exists(os.path.join(ckpt_dir, 'config.yaml')) else {}
+    eval_model_params = _with_bc_quant(model_params, bc_train_params)
+    bc_model = _load_model('eval', bc_path, eval_model_params, output_dim, bc_format_name, device)
 
     mips_gpu = [m.to(device) for m in mipmaps]
     psnr_bc, _ = evaluate_full(bc_model, mips_gpu, device)

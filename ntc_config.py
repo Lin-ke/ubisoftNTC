@@ -11,11 +11,18 @@
       target_res: 256
 
     model:
+      encoding: pyramid            # pyramid | hash_grid (legacy: mipmap)
       feature_configs: [[512,8,3], [256,7,3], [128,6,3], [64,5,3]]
       hidden_dim: 16
       num_layers: 1
       filter: trilinear           # trilinear | tricubic
       half_pixel_offsets: [1, 3]  # 在哪些 feature grid 索引上施加半像素偏移
+      hash_grid:                  # 仅 encoding: hash_grid 时使用
+        n_levels: 7
+        n_features_per_level: 8
+        log2_hashmap_size: 15
+        base_resolution: 4
+        finest_resolution: 256
 
     uc_training:                  # 训练无约束基线模型 (只在 --train-uc 时使用)
       total_iterations: 10000
@@ -41,6 +48,13 @@ import yaml
 from typing import Dict, Any
 
 
+_DEFAULT_HASH_GRID_QUANT = {
+    'bits': 8,
+    'block_size': 0,
+    'scale_bits': 16,
+}
+
+
 # ---------- 加载/校验 ----------
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -48,8 +62,25 @@ def load_config(path: str) -> Dict[str, Any]:
     with open(path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
+    __normalize(config)
     __validate(config)
     return config
+
+
+def __normalize(config: Dict[str, Any]):
+    """Normalize legacy config spelling before validation/use."""
+    model = config.get('model')
+    if isinstance(model, dict):
+        if model.get('encoding', 'pyramid') == 'mipmap':
+            model['encoding'] = 'pyramid'
+        else:
+            model.setdefault('encoding', 'pyramid')
+
+    bc_training = config.get('bc_training')
+    if isinstance(bc_training, dict):
+        q = dict(_DEFAULT_HASH_GRID_QUANT)
+        q.update(bc_training.get('hash_grid_quant') or {})
+        bc_training['hash_grid_quant'] = q
 
 
 def __validate(config: Dict[str, Any]):
@@ -64,13 +95,44 @@ def __validate(config: Dict[str, Any]):
         raise ValueError(f"不支持的 BC 格式: '{bc_format}', 支持: {', '.join(supported)}")
 
     model = config['model']
-    for key in ('feature_configs', 'hidden_dim'):
+    encoding = model.get('encoding', 'pyramid')
+    if encoding not in ('pyramid', 'hash_grid'):
+        raise ValueError("model.encoding 仅支持 'pyramid' | 'hash_grid' (legacy: 'mipmap')")
+
+    for key in ('hidden_dim',):
         if key not in model:
             raise ValueError(f"model 缺少 '{key}'")
+
+    if encoding == 'pyramid' and 'feature_configs' not in model:
+        raise ValueError("model.encoding=pyramid 时 model 缺少 'feature_configs'")
+
+    if encoding == 'hash_grid':
+        hg = model.get('hash_grid')
+        if not isinstance(hg, dict):
+            raise ValueError("model.encoding=hash_grid 时必须提供 model.hash_grid 字典")
+        for key in ('n_levels', 'n_features_per_level', 'base_resolution'):
+            if key not in hg:
+                raise ValueError(f"model.hash_grid 缺少 '{key}'")
+        if hg.get('dim', 2) != 2:
+            raise ValueError("当前纹理模型仅支持 model.hash_grid.dim=2")
+        finest_resolution = hg.get('finest_resolution', 256)
+        if finest_resolution < hg.get('base_resolution', 1):
+            raise ValueError("model.hash_grid.finest_resolution 必须 >= base_resolution")
 
     for key in ('total_iterations', 'batch_res'):
         if key not in config['bc_training']:
             raise ValueError(f"bc_training 缺少 '{key}'")
+
+    hgq = config['bc_training'].get('hash_grid_quant', {})
+    for key in ('bits', 'block_size', 'scale_bits'):
+        if key not in hgq:
+            raise ValueError(f"bc_training.hash_grid_quant 缺少 '{key}'")
+    if int(hgq['bits']) < 2:
+        raise ValueError("bc_training.hash_grid_quant.bits 必须 >= 2")
+    if int(hgq['block_size']) < 0:
+        raise ValueError("bc_training.hash_grid_quant.block_size 必须 >= 0")
+    if int(hgq['scale_bits']) < 0:
+        raise ValueError("bc_training.hash_grid_quant.scale_bits 必须 >= 0")
 
     if 'uc_training' in config:
         for key in ('total_iterations', 'batch_res'):
@@ -82,7 +144,7 @@ def __validate(config: Dict[str, Any]):
         raise ValueError(f"loss 仅支持 'l1' | 'mse'")
 
     filt = config['model'].get('filter', 'trilinear')
-    if filt != 'trilinear':
+    if encoding == 'pyramid' and filt != 'trilinear':
         raise ValueError(
             f"model.filter 必须为 'trilinear' (当前: '{filt}'). "
             f"bicubic/tricubic 不对应 GPU 硬件采样行为, 已禁用."
@@ -94,7 +156,20 @@ def __validate(config: Dict[str, Any]):
 def get_model_params(config: Dict[str, Any]) -> Dict[str, Any]:
     """提取模型参数 (feature grids + MLP 形状)."""
     m = config['model']
+    encoding = m.get('encoding', 'pyramid')
+    if encoding == 'mipmap':
+        encoding = 'pyramid'
+    if encoding == 'hash_grid':
+        return {
+            'encoding': 'hash_grid',
+            'hash_grid': dict(m.get('hash_grid', {})),
+            'hidden_dim': m['hidden_dim'],
+            'num_layers': m.get('num_layers', 1),
+            'activation': m.get('activation', 'leaky_relu'),
+            'output_activation': m.get('output_activation', 'hard_swish'),
+        }
     return {
+        'encoding': 'pyramid',
         'feature_configs': [tuple(fc) for fc in m['feature_configs']],
         'hidden_dim': m['hidden_dim'],
         'num_layers': m.get('num_layers', 1),
@@ -122,6 +197,8 @@ def get_uc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def get_bc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
     t = config['bc_training']
+    q = dict(_DEFAULT_HASH_GRID_QUANT)
+    q.update(t.get('hash_grid_quant') or {})
     return {
         'total_iterations': t['total_iterations'],
         'batch_res': t['batch_res'],
@@ -132,6 +209,7 @@ def get_bc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'loss_fn': config.get('loss', 'l1'),
         'loss_channels': t.get('loss_channels', None),
         'max_useful_lod': t.get('max_useful_lod', None),
+        'hash_grid_quant': q,
     }
 
 
@@ -177,5 +255,3 @@ def get_benchmark_params(config: Dict[str, Any]) -> Dict[str, Any]:
         'timing_iters': b.get('timing_iters', 20),
         'mlp_param_bits': b.get('mlp_param_bits', 16),
     }
-
-

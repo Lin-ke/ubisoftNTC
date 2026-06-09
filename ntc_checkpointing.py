@@ -37,10 +37,11 @@ def _restore_model_params_from_ckpt(ckpt_dir, model_params, verbose=False):
             print(f"Config validation warning (ignored): {e}")
 
     ckpt_model_params = get_model_params(saved)
-    for k in ('feature_configs', 'hidden_dim', 'num_layers', 'half_pixel_offsets'):
-        model_params[k] = ckpt_model_params[k]
+    for k in ('encoding', 'feature_configs', 'hash_grid', 'hidden_dim', 'num_layers',
+              'half_pixel_offsets', 'activation', 'output_activation'):
+        if k in ckpt_model_params:
+            model_params[k] = ckpt_model_params[k]
     if verbose:
         print(f"Loaded model shape from {ckpt_yaml}")
-
 
 

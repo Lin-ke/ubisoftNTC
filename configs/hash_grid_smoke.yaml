@@ -1,0 +1,50 @@
+# Smoke config for the pure-PyTorch hash-grid UC -> BC(QAT) -> BC-MLP flow.
+bc_format: bc1
+loss: l1
+
+model:
+  encoding: hash_grid
+  hidden_dim: 16
+  num_layers: 1
+  activation: leaky_relu
+  output_activation: hard_swish
+  hash_grid:
+    dim: 2
+    n_levels: 4
+    n_features_per_level: 4
+    log2_hashmap_size: 12
+    base_resolution: 4
+    finest_resolution: 64
+
+uc_training:
+  total_iterations: 10
+  batch_res: 32
+  lr_feat: 5.0e-3
+  lr_mlp: 2.0e-3
+  gamma: 1.0
+
+bc_training:
+  total_iterations: 10
+  batch_res: 32
+  lr_feat: 1.0e-2
+  lr_mlp: 1.0e-3
+  betas: [0.9, 0.999]
+  hash_grid_quant:
+    bits: 8
+    block_size: 0
+    scale_bits: 16
+
+bc_mlp_training:
+  total_iterations: 5
+  batch_res: 32
+  lr_mlp: 1.0e-3
+  betas: [0.9, 0.999]
+
+dataset:
+  root: dataset
+  target_res: 64
+
+benchmark:
+  warmup_iters: 1
+  timing_iters: 1
+  mlp_param_bits: 16

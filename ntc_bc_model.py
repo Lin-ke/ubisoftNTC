@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ntc_model import HashGridTextureModel, _fast_hash
+
 from ntc_visualization import (
     _normalize_channel_names,
     _default_inference_channels,
@@ -401,6 +403,153 @@ class NeuralBCTextureModel(nn.Module):
             bc_grid.init_from_uc_grid(uc_grid)
 
 
+def _quantize_ste_symmetric(x, bits=8, block_size=0):
+    """Simple symmetric STE fake quantization for hash embeddings."""
+    bits = int(bits)
+    block_size = int(block_size or 0)
+    qmax = float((1 << (bits - 1)) - 1)
+    if qmax < 1:
+        return x
+
+    if block_size <= 0 or x.numel() <= block_size:
+        scale = x.detach().abs().max().clamp(min=1e-8) / qmax
+        xq = (x / scale).round().clamp(-qmax, qmax) * scale
+    else:
+        flat = x.reshape(-1)
+        pad = (block_size - flat.numel() % block_size) % block_size
+        if pad:
+            flat_padded = F.pad(flat, (0, pad))
+        else:
+            flat_padded = flat
+        blocks = flat_padded.reshape(-1, block_size)
+        scale = blocks.detach().abs().max(dim=1, keepdim=True).values.clamp(min=1e-8) / qmax
+        q = (blocks / scale).round().clamp(-qmax, qmax) * scale
+        xq = q.reshape(-1)[:flat.numel()].reshape_as(x)
+
+    if not torch.is_grad_enabled():
+        return xq
+    return x + (xq - x).detach()
+
+
+class QATHashGridLevel(nn.Module):
+    """Hash-grid level wrapper that fake-quantizes embedding weights with STE."""
+
+    def __init__(self, dim, n_features, hashmap_size, resolution, primes, bin_mask, quant_cfg):
+        super().__init__()
+        self.dim = dim
+        self.n_features = n_features
+        self.hashmap_size = hashmap_size
+        self.resolution = resolution
+        self.embedding = nn.Embedding(hashmap_size, n_features)
+        nn.init.uniform_(self.embedding.weight, a=-1e-4, b=1e-4)
+        self.register_buffer('primes', primes.clone(), persistent=False)
+        self.register_buffer('bin_mask', bin_mask.clone(), persistent=False)
+        self.quant_cfg = dict(quant_cfg or {})
+
+    def forward(self, x):
+        weight = self.embedding.weight
+        q_weight = _quantize_ste_symmetric(
+            weight,
+            bits=self.quant_cfg.get('bits', 8),
+            block_size=self.quant_cfg.get('block_size', 0),
+        )
+        bdims = len(x.shape[:-1])
+        x = torch.clamp(x, 0.0, 1.0) * self.resolution
+        xi = x.long()
+        xf = x - xi.float().detach()
+        xi = xi.unsqueeze(-2)
+        xf = xf.unsqueeze(-2)
+        bin_mask = self.bin_mask.reshape((1,) * bdims + self.bin_mask.shape)
+        inds = torch.where(bin_mask, xi, xi + 1)
+        ws = torch.where(bin_mask, 1 - xf, xf)
+        w = ws.prod(dim=-1, keepdim=True)
+        hash_ids = _fast_hash(inds, self.primes, self.hashmap_size)
+        neig_data = F.embedding(hash_ids, q_weight)
+        return (neig_data * w).sum(dim=-2)
+
+
+class QATMultiResHashGrid(nn.Module):
+    def __init__(self, uc_hash_grid, quant_cfg):
+        super().__init__()
+        self.dim = uc_hash_grid.dim
+        self.n_levels = uc_hash_grid.n_levels
+        self.n_features_per_level = uc_hash_grid.n_features_per_level
+        self.log2_hashmap_size = uc_hash_grid.log2_hashmap_size
+        self.base_resolution = uc_hash_grid.base_resolution
+        self.finest_resolution = uc_hash_grid.finest_resolution
+        self.output_dim = uc_hash_grid.output_dim
+        self.levels = nn.ModuleList([
+            QATHashGridLevel(
+                level.dim, level.n_features, level.hashmap_size,
+                level.resolution, level.primes, level.bin_mask, quant_cfg,
+            )
+            for level in uc_hash_grid.levels
+        ])
+
+    def forward(self, x):
+        return torch.cat([lvl(x) for lvl in self.levels], dim=-1)
+
+    def iter_param_tensors(self):
+        for lvl in self.levels:
+            yield lvl.embedding.weight
+
+
+class NeuralBCHashGridTextureModel(HashGridTextureModel):
+    """Minimal hash-grid QAT model sharing UC->BC->BC-MLP training surface."""
+
+    def __init__(self, hash_grid_config, hidden_dim, output_dim,
+                 quant_cfg=None, num_layers=1, activation='leaky_relu',
+                 output_activation='hard_swish'):
+        super().__init__(hash_grid_config, hidden_dim, output_dim,
+                         num_layers=num_layers, activation=activation,
+                         output_activation=output_activation)
+        self.quant_cfg = dict(quant_cfg or {})
+        self.hash_grid = QATMultiResHashGrid(self.hash_grid, self.quant_cfg)
+        self.feature_grids = nn.ModuleList([self.hash_grid])
+
+    @torch.no_grad()
+    def init_from_uc(self, uc_model):
+        self.mlp.load_state_dict(uc_model.mlp.state_dict())
+        for bc_level, uc_level in zip(self.hash_grid.levels, uc_model.hash_grid.levels):
+            bc_level.embedding.weight.copy_(uc_level.embedding.weight)
+
+    def estimated_bits(self, mlp_param_bits=16):
+        bits = int(self.quant_cfg.get('bits', 8))
+        scale_bits = int(self.quant_cfg.get('scale_bits', 16))
+        block_size = int(self.quant_cfg.get('block_size', 0) or 0)
+        total_bits = 0
+        for weight in self.hash_grid.iter_param_tensors():
+            total_bits += weight.numel() * bits
+            if block_size > 0:
+                blocks = (weight.numel() + block_size - 1) // block_size
+                total_bits += blocks * scale_bits
+            elif scale_bits > 0:
+                total_bits += scale_bits
+        mlp_params = sum(p.numel() for p in self.mlp.parameters())
+        return total_bits + mlp_params * mlp_param_bits
+
+    compute_storage_bits = estimated_bits
+
+    @staticmethod
+    def compute_reference_bits(dataset_root, material_name):
+        return NeuralBCTextureModel.compute_reference_bits(dataset_root, material_name)
+
+    def compute_compression_stats(self, dataset_root, material_name, mlp_param_bits=16):
+        bc_bits = self.estimated_bits(mlp_param_bits=mlp_param_bits)
+        png_bits = self.compute_reference_bits(dataset_root, material_name)
+        return {
+            'bc_bits': bc_bits,
+            'png_bits': png_bits,
+            'compression_ratio': round(bc_bits / max(png_bits, 1), 4),
+        }
+
+    def set_inference_channels(self, channels=None, ref_dim=9):
+        return NeuralBCTextureModel.set_inference_channels(self, channels, ref_dim)
+
+    def get_inference_channels(self):
+        return NeuralBCTextureModel.get_inference_channels(self)
+
+
 # ============================================================
 # 工厂函数
 # ============================================================
@@ -414,6 +563,22 @@ def make_bc_model(model_params, output_dim=9, bc_format_name='bc1'):
         output_dim: MLP 输出维度
         bc_format_name: BC 格式名称 (bc1~bc5)
     """
+    encoding = model_params.get('encoding', 'pyramid')
+    if encoding == 'mipmap':
+        encoding = 'pyramid'
+    if encoding == 'hash_grid':
+        return NeuralBCHashGridTextureModel(
+            hash_grid_config=model_params.get('hash_grid', {}),
+            hidden_dim=model_params['hidden_dim'],
+            output_dim=output_dim,
+            quant_cfg=model_params.get('hash_grid_quant', {}),
+            num_layers=model_params.get('num_layers', 1),
+            activation=model_params.get('activation', 'leaky_relu'),
+            output_activation=model_params.get('output_activation', 'hard_swish'),
+        )
+    if encoding != 'pyramid':
+        raise ValueError(f"Unsupported model encoding: {encoding}")
+
     bc_format = get_bc_format(bc_format_name)
 
     return NeuralBCTextureModel(
