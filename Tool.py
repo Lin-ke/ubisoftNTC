@@ -8,8 +8,7 @@ import argparse
 from dataset import MaterialDataset
 from ntc_model import make_model
 from ntc_bc_model import make_bc_model
-from ntc_train import sample_reference, evaluate_full
-from ntc_bc_train import sample_lod_vaidyanathan
+from ntc_train import sample_reference, evaluate_full,sample_lod_vaidyanathan
 from ntc_utils import compute_traditional_bc_psnr
 from ntc_config import (
     load_config,
@@ -27,7 +26,6 @@ from ntc_reporting import (
     summarize,
     save_tsv,
     _write_eval_done,
-    _write_train_done,
 )
 from ntc_checkpointing import (
     _bc_ckpt_path,
@@ -360,10 +358,10 @@ def _run_pipeline_materials(names, ds, model_params, uc_params, bc_params, mlp_p
 # 多进程 Worker
 # ============================================================
 
-def _make_dataset(dataset_params, target_res):
-    """统一构造 MaterialDataset。target_res=None 表示加载原生 2K。"""
+def _make_dataset(dataset_params):
+    """统一构造 MaterialDataset, 始终使用原生 2K 分辨率."""
     return MaterialDataset(
-        dataset_params['root'], target_res=target_res, preload=True,
+        dataset_params['root'], target_res=None, preload=True,
         output_channels=dataset_params.get('output_channels', 'full'),
     )
 
@@ -382,7 +380,7 @@ def _mp_pipeline_worker(args):
     mlp_params = get_bc_mlp_training_params(config)
     dataset_params = get_dataset_params(config)
 
-    ds = _make_dataset(dataset_params, dataset_params['target_res'])
+    ds = _make_dataset(dataset_params)
     return _run_pipeline_materials(
         names, ds, model_params, uc_params, bc_params, mlp_params,
         bc_format_name, device, ckpt_dir, prefix=f"[{gpu_id}] ",
@@ -417,7 +415,7 @@ def _mp_eval_worker(args):
     model_params = get_model_params(config)
     dataset_params = get_dataset_params(config)
 
-    ds = _make_dataset(dataset_params, target_res=None)
+    ds = _make_dataset(dataset_params)
     ds_root = dataset_params['root']
 
     _restore_model_params_from_ckpt(ckpt_dir, model_params)
@@ -459,7 +457,7 @@ def pipeline_train(config_path, ckpt=None, materials=None, num_workers=1, gpus=N
     dataset_params = get_dataset_params(config)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    ds = _make_dataset(dataset_params, dataset_params['target_res'])
+    ds = _make_dataset(dataset_params)
     names = materials if materials else ds.material_names
 
     gpu_ids = gpus if gpus else [0]
@@ -492,9 +490,7 @@ def pipeline_train(config_path, ckpt=None, materials=None, num_workers=1, gpus=N
             bc_format_name, device, ckpt_dir,
         )
 
-    _write_train_done('train-uc', ckpt_dir, config_path, bc_format_name, num_workers, uc_results)
-    _write_train_done('train-bc', ckpt_dir, config_path, bc_format_name, num_workers, bc_results)
-    _write_train_done('train-bc-mlp', ckpt_dir, config_path, bc_format_name, num_workers, mlp_results)
+    # done.json 由后续 eval 阶段统一写入, 避免重复覆盖.
 
     print(f"\n{'='*60}")
     print(f"Pipeline complete.  {len(uc_results)} materials × (UC → BC → BC-MLP)")
@@ -534,7 +530,7 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     ds_root = dataset_params['root']
 
-    ds = _make_dataset(dataset_params, dataset_params['target_res'])
+    ds = _make_dataset(dataset_params)
     print(f"Device: {device}  |  Config: {args.config}  |  Res: native")
     print(f"BC format: {bc_format_name.upper()}  |  Filter: {model_params.get('filter')}  |  GT filter: bicubic")
     print(f"Loaded {len(ds)} materials from {ds_root}\n")
@@ -557,23 +553,19 @@ def main():
         names_split[i % num_workers].append(name)
 
     if args.train:
-        pipeline_train(args.config, ckpt=args.ckpt, materials=names,
-                       num_workers=num_workers, gpus=gpu_ids)
-        return
+        ckpt_dir = pipeline_train(args.config, ckpt=args.ckpt, materials=names,
+                                  num_workers=num_workers, gpus=gpu_ids)
+    else:
+        ckpt_dir = args.ckpt
 
-    if not args.ckpt:
+    if not ckpt_dir:
         print("ERROR: eval 模式需要 --ckpt <checkpoints/xxx/>")
         print("Usage:")
         print("  python Tool.py --config <yaml> --train")
         print("  python Tool.py --config <yaml> --ckpt <dir/>")
         sys.exit(1)
 
-    ckpt_dir = args.ckpt
     _restore_model_params_from_ckpt(ckpt_dir, model_params, verbose=True)
-
-    # Eval 在原生 2K 上进行（而非训练时的 target_res）。
-    ds = _make_dataset(dataset_params, target_res=None)
-    print(f"[eval] Reloaded dataset at full (2K) resolution")
 
     bc_params = get_bc_training_params(config)
 

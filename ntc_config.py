@@ -8,7 +8,6 @@
 
     dataset:
       root: dataset
-      target_res: 256
 
     model:
       encoding: pyramid            # pyramid | hash_grid (legacy: mipmap)
@@ -214,24 +213,10 @@ def get_bc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def get_dataset_params(config: Dict[str, Any]) -> Dict[str, Any]:
-    """提取数据集配置.
-
-    注意 (论文对齐):
-        论文 (Sec 5.1) 明确以原生 2K 参考构建完整 mipmap 金字塔, 训练通过
-        连续 (u, v, s) 采样在两 mip 之间做 bicubic 滤波得到 GT.
-        因此本工程 *不* 对原图做任何下采样, 强制 target_res = None.
-        若 yaml 中仍存在 dataset.target_res, 给出警告并忽略.
-    """
+    """提取数据集配置."""
     d = config.get('dataset', {})
-    raw_target_res = d.get('target_res', None)
-    if raw_target_res is not None:
-        print(
-            f"[WARN] dataset.target_res={raw_target_res} 已废弃 (论文对齐: "
-            f"GT 必须为原生分辨率的 mipmap 金字塔). 强制忽略, 使用原生分辨率."
-        )
     return {
         'root': d.get('root', 'dataset'),
-        'target_res': None,  # 强制原生分辨率, 见 docstring
         'output_channels': d.get('output_channels', 'full'),
     }
 

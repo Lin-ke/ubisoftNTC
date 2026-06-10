@@ -170,3 +170,28 @@ Compression后应该做QAT，以解决压缩目标（重建参数图）和解压
 - 重跑 bc1_bcf05k 基线，记录 PSNR 变化作为新 baseline
 - batch 采样目前还是 `_sample_uv_and_lod` 的小窗口（`batch_res/ref_w` ≈ 6%），论文是覆盖整个 [0,1]² 的均匀 grid，可能下一步也要修
 - max_useful_lod 之类的剪枝逻辑要重新评估：原来按 9 层 mip 调的，现在 12 层
+
+## 2026-06-09 23:25 smoking test v2
+- config: smoke_10iter.yaml (UC=10, BC=10, BC-MLP=10 iters)
+- hidden_dim=8, batch_res=32, target_res=64, 2 workers
+- pid=12912, log=logs\train_20260609_232521.log
+- eval: ckpt=2026-06-09_232624, psnr_bc=5.22, psnr_drop=14.88, inference_ms=34.23
+- pipeline OK (UC→BC→BC-MLP→Eval all green)
+
+## 2026-06-10 00:57 smoke test v3
+- config: smoke_10iter.yaml (UC=10, BC=10, BC-MLP=10 iters)
+- hidden_dim=8, batch_res=32, 2 workers
+- ckpt=2026-06-10_005722
+- eval: psnr_bc=5.56, psnr_drop=14.54, inference_ms=34.29, compression_ratio=0.000115
+- pipeline OK, 61.9s total for 20 materials
+- consistent with v2 (psnr_bc=5.22, drop=14.88)
+- next: 重跑 bc1_bcf05k 基线（GT/feature滤波解耦后首个完整基线）
+
+## 2026-06-10 01:10 smoke test v4
+- config: smoke_10iter.yaml (UC=10, BC=10, BC-MLP=10 iters)
+- hidden_dim=8, batch_res=32, 1 worker, gpu=0
+- ckpt=2026-06-10_011115
+- eval: psnr_bc=5.05, psnr_drop=15.05, inference_ms=24.04, compression_ratio=0.000115
+- pipeline OK, 38s total for 20 materials (single worker)
+- consistent with v3 (psnr_bc=5.56, drop=14.54), slightly worse but within noise
+- next: 启动 bc1_bcf05k 完整基线 (UC=5k, BC=200k, BC-MLP=1k, 2workers)

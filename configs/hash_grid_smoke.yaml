@@ -42,7 +42,6 @@ bc_mlp_training:
 
 dataset:
   root: dataset
-  target_res: 64
 
 benchmark:
   warmup_iters: 1

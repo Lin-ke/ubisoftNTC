@@ -36,7 +36,6 @@ bc_mlp_training:
 
 dataset:
   root: dataset
-  target_res: 256
   output_channels: compact
 
 benchmark:

@@ -53,21 +53,6 @@ def save_tsv(all_results, ckpt_dir, suffix):
     print(f"Saved to {path}")
 
 
-def _summarize_train_results(results):
-    times = [r['time_total'] for r in results]
-    losses = [r['train_loss'] for r in results if r.get('train_loss') is not None]
-    data = {
-        'time_total': round(sum(times), 3) if times else 0.0,
-        'time_avg': round(float(np.mean(times)), 3) if times else 0.0,
-        'num_materials': len(results),
-    }
-    if losses:
-        data['train_loss'] = round(float(np.mean(losses)), 8)
-        data['train_loss_min'] = round(float(np.min(losses)), 8)
-        data['train_loss_max'] = round(float(np.max(losses)), 8)
-    return data
-
-
 def _summarize_eval_results(all_results):
     data = {'num_materials': len(all_results)}
     for k in ('psnr_bc_ref', 'psnr_bc', 'psnr_drop', 'inference_ms', 'compression_ratio'):
@@ -94,16 +79,3 @@ def _write_eval_done(mode, ckpt_dir, config_path, bc_format_name,
     })
     write_done_json("eval", ckpt_dir, done_data)
 
-
-def _write_train_done(mode, ckpt_dir, config_path, bc_format_name,
-                      num_workers, train_results):
-    done_data = _summarize_train_results(train_results)
-    done_data.update({
-        'mode': mode,
-        'config': config_path,
-        'bc_format': bc_format_name,
-        'num_workers': num_workers,
-    })
-    if mode == 'train-bc':
-        done_data['bc_ckpt_dir'] = os.path.join(ckpt_dir, f'bc_{bc_format_name}')
-    write_done_json(mode, ckpt_dir, done_data)

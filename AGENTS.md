@@ -11,7 +11,7 @@
 - **Secondary**: 跟踪推理时延 `inference_ms` 和压缩率 `compression_ratio = bc_bits / png_bits`，时延要尽可能低。你需要在保证模型的实验的情况下，尽量提高PSNR；其次是提高压缩率。
 
 ### 当前探索方向
-技术路线：`--train` 一键执行三阶段流水线 UC → BC QAT → BC-MLP finetune，内部自动衔接。
+技术路线：`--train` 一键执行三阶段流水线 UC → BC QAT → BC-MLP finetune，并在末尾自动追加 Eval，内部自动衔接。
 
 其他见**notes.md**
 
@@ -49,7 +49,7 @@ ntc/
 
 ### 关键模块说明
 
-- **`dataset.py`**：`MaterialDataset` 加载所有材质，构建 mipmap 金字塔（`build_mipmaps`）。`target_res` 默认 256。
+- **`dataset.py`**：`MaterialDataset` 加载所有材质，构建 mipmap 金字塔（`build_mipmaps`），始终使用原生 2K 分辨率。
 - **`ntc_model.py`**：
   - `MipmapFeatureGrid`：可学习的多分辨率特征金字塔，支持 `trilinear` / `tricubic` 采样。
   - `NeuralTextureModel`：拼接多个特征网格 → MLP → 输出 9 通道材质。
@@ -74,10 +74,11 @@ usage: Tool.py [-h] --config CONFIG [--train] [--ckpt CKPT]
 
 
 ```bash
-# Train (一键流水线: UC → BC → BC-MLP, 4 worker parallel)
+# Train (一键流水线: UC → BC → BC-MLP → Eval, 4 worker parallel)
+# --train 会在三阶段训练完成后, 自动用同一个 ckpt 目录执行 Eval, 仅写一次 .loopit/done.json
 python Tool.py --config configs/bc1_bcf05k.yaml --train --num-workers 4
 
-# Eval (4 worker parallel, reuse same --ckpt)
+# 仅 Eval (复用已有 ckpt, 不重新训练)
 python Tool.py --config configs/bc1_bcf05k.yaml --ckpt checkpoints/<ts>/ --num-workers 4
 ```
 
@@ -104,7 +105,6 @@ loss_config: {}               # 可选: 通道权重等
 
 dataset:
   root: dataset
-  target_res: 256
 
 model:
   feature_configs: [[512,8,3], [256,7,3], [128,6,3], [64,5,3]]
@@ -148,7 +148,7 @@ benchmark:
 
 ### 实验纪律
 a- 所有可调参数必须放在 YAML 中，不要硬编码到逻辑里。
-b- train和eval的代码最后，必须调用write_done_json！！！
+b- train和eval的代码最后，必须调用write_done_json！！(`--train` 流程末尾的 eval 阶段会统一写入, train 三阶段不再各自写, 避免覆盖.)
 
 ### Git 使用
 - `notes.md` 是跨 session 的共享笔记，**追加不写覆盖**。
@@ -219,7 +219,7 @@ Eval
 ## 注意事项！！！
 a- `train_start.py` **默认后台运行并自动检查启动日志**（等待 10 秒后扫描日志中的异常），启动后立即返回。Agents 直接运行即可，无需额外监控。完成后我会提醒你。
 
-b- train和eval的代码最后，必须调用write_done_json！！！
+b- train和eval的代码最后，必须调用write_done_json！！(`--train` 流程末尾的 eval 阶段会统一写入, train 三阶段不再各自写, 避免覆盖.)
 
 c- 禁止行为：不要使用 `tail -f`、`Get-Content -Wait`、循环轮询日志、等待训练完成。`train_start.py` 已内置启动检查。
 
