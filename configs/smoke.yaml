@@ -1,0 +1,43 @@
+# Estimate timing — 1000 BC iters with full model
+bc_format: bc1
+loss: l1
+
+model:
+  filter: trilinear
+  num_layers: 2
+  half_pixel_offsets: [1, 3]
+  feature_configs:
+    - [2048, 10, 3]
+    - [2048, 10, 3]
+    - [1024, 9, 3]
+    - [1024, 9, 3]
+  hidden_dim: 16
+  output_activation: none
+
+uc_training:
+  total_iterations: 500
+  batch_res: 128
+  lr_feat: 5.0e-2
+  lr_mlp: 1.0e-3
+  gamma: 0.9995
+
+bc_training:
+  total_iterations: 1000
+  batch_res: 128
+  lr_feat: 1.0e-2
+  lr_mlp: 1.0e-3
+  betas: [0.9, 0.999]
+bc_mlp_training:
+  total_iterations: 50
+  batch_res: 128
+  lr_mlp: 1.0e-3
+  betas: [0.9, 0.999]
+
+
+dataset:
+  root: dataset/dataset
+
+benchmark:
+  warmup_iters: 2
+  timing_iters: 5
+  mlp_param_bits: 16

@@ -127,17 +127,18 @@ def compute_traditional_bc_psnr(ref_tensor, bc_format='bc1'):
 
 
 def reconstruct_normal(normal_xy):
-    """从 XY 分量重建法线 Z 分量."""
-    xy = normal_xy
+    """从 [0,1] 范围的 XY 分量重建法线 Z 分量.
+
+    先将 [0,1] 映射到 [-1,1]，再按单位向量约束重建 Z。
+    """
+    xy = normal_xy * 2.0 - 1.0  # [0,1] -> [-1,1]
     z = torch.sqrt(torch.clamp(1.0 - xy[:, 0:1] ** 2 - xy[:, 1:2] ** 2, min=0))
     return torch.cat([xy, z], dim=1)
 
 
-def save_image(tensor, path, is_normal=False):
+def save_image(tensor, path):
     """将 [C, H, W] tensor 保存为图像."""
     img = tensor.detach().cpu().permute(1, 2, 0).numpy()
-    if is_normal:
-        img = (img + 1.0) / 2.0
     img = np.clip(img, 0, 1)
     img = (img * 255).astype(np.uint8)
     if img.shape[2] == 1:

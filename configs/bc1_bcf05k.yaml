@@ -2,6 +2,14 @@
 bc_format: bc1
 loss: l1
 
+# batched (ensemble) 训练分组大小. 0=全部一组(M=全部); N>0=每组N个材质.
+# 12GB 显存 (RTX 5070): BC 最坏 LOD0 解压峰值约 0.67GB/材质, M=10≈6.7GB(安全),
+# M=12≈8GB(可用), M=16≈10.7GB(临界), M>=18 OOM.
+# 注意: 材质按分辨率分桶, 18 个 2048² + 1 个 4096×2048 + 1 个 2083×2048,
+#       故 M=10 实际分组为 [10, 8, 1, 1] 共 4 组, 而非 2 组.
+# 大显存卡可调大或设 0.
+batch_materials: 10
+
 model:
   filter: trilinear
   num_layers: 2
@@ -17,6 +25,7 @@ model:
 uc_training:
   total_iterations: 5000
   batch_res: 128
+  uv_sampling: tile
   lr_feat: 5.0e-2
   lr_mlp: 1.0e-3
   gamma: 0.9995
@@ -24,18 +33,20 @@ uc_training:
 bc_training:
   total_iterations: 200000
   batch_res: 128
+  uv_sampling: tile
   lr_feat: 1.0e-2
   lr_mlp: 1.0e-3
   betas: [0.9, 0.999]
 bc_mlp_training:
   total_iterations: 1000
   batch_res: 128
+  uv_sampling: tile
   lr_mlp: 1.0e-3
   betas: [0.9, 0.999]
 
 
 dataset:
-  root: dataset
+  root: dataset/dataset
 
 benchmark:
   warmup_iters: 5

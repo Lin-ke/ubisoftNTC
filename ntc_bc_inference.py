@@ -29,14 +29,11 @@
 """
 
 import torch
-import torch.nn.functional as F
-import numpy as np
-from PIL import Image
 import os
 import argparse
 
 from ntc_model import make_model
-from ntc_bc_model import make_bc_model, get_bc_format
+from ntc_bc_model import make_bc_model
 from dataset import load_material, build_mipmaps
 from ntc_utils import reconstruct_normal, save_image, compute_psnr
 
@@ -187,7 +184,7 @@ def infer_from_checkpoint(checkpoint_path, bc_format_name, material_dir, target_
     normal_full = reconstruct_normal(normal_xy)
 
     save_image(albedo.squeeze(0), f'{output_dir}/albedo_pred.png')
-    save_image(normal_full.squeeze(0), f'{output_dir}/normal_pred.png', is_normal=True)
+    save_image(normal_full.squeeze(0), f'{output_dir}/normal_pred.png')
     save_image(ao.squeeze(0), f'{output_dir}/ao_pred.png')
     save_image(roughness.squeeze(0), f'{output_dir}/roughness_pred.png')
     save_image(metalness.squeeze(0), f'{output_dir}/metalness_pred.png')
@@ -199,7 +196,7 @@ def infer_from_checkpoint(checkpoint_path, bc_format_name, material_dir, target_
     ref_metalness = ref[8:9].unsqueeze(0)
 
     save_image(ref_albedo.squeeze(0), f'{output_dir}/albedo_ref.png')
-    save_image(ref_normal.squeeze(0), f'{output_dir}/normal_ref.png', is_normal=True)
+    save_image(ref_normal.squeeze(0), f'{output_dir}/normal_ref.png')
     save_image(ref_ao.squeeze(0), f'{output_dir}/ao_ref.png')
     save_image(ref_roughness.squeeze(0), f'{output_dir}/roughness_ref.png')
     save_image(ref_metalness.squeeze(0), f'{output_dir}/metalness_ref.png')
@@ -384,10 +381,8 @@ def compare_methods(checkpoint_path, bc_format_name, material_dir, target_res, o
         if diff.shape[1] > 1:
             diff = diff.mean(dim=1, keepdim=True)
 
-        save_image(pred_img.squeeze(0), f'{output_dir}/{name}_pred.png',
-                   is_normal=(name == 'normal'))
-        save_image(ref_img.squeeze(0), f'{output_dir}/{name}_ref.png',
-                   is_normal=(name == 'normal'))
+        save_image(pred_img.squeeze(0), f'{output_dir}/{name}_pred.png')
+        save_image(ref_img.squeeze(0), f'{output_dir}/{name}_ref.png')
         save_image(diff.squeeze(0), f'{output_dir}/{name}_diff.png')
 
     print(f"\n[{model_label}] Compare Results:")

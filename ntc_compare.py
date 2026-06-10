@@ -17,14 +17,13 @@ BC 格式一键对比工具
 """
 
 import torch
-import numpy as np
 import os
 import sys
 import argparse
 
-from ntc_bc_model import make_bc_model, get_bc_format
+from ntc_bc_model import make_bc_model
 from ntc_bc_inference import get_bits_per_block
-from dataset import load_material, build_mipmaps
+from dataset import load_material
 from ntc_utils import reconstruct_normal, save_image, compute_psnr
 
 _DEFAULT_MODEL_PARAMS = {
@@ -119,7 +118,7 @@ def save_comparison_images(predictions, ref, output_dir):
     ref_metalness = ref[8:9]
 
     save_image(ref_albedo, f'{output_dir}/ref_albedo.png')
-    save_image(ref_normal, f'{output_dir}/ref_normal.png', is_normal=True)
+    save_image(ref_normal, f'{output_dir}/ref_normal.png')
     save_image(ref_ao, f'{output_dir}/ref_ao.png')
     save_image(ref_roughness, f'{output_dir}/ref_roughness.png')
     save_image(ref_metalness, f'{output_dir}/ref_metalness.png')
@@ -140,8 +139,7 @@ def save_comparison_images(predictions, ref, output_dir):
             ('roughness', roughness, ref_roughness.unsqueeze(0)),
             ('metalness', metalness, ref_metalness.unsqueeze(0)),
         ]:
-            save_image(p.squeeze(0), f'{output_dir}/{fmt_name}_{ch_name}_pred.png',
-                       is_normal=(ch_name == 'normal'))
+            save_image(p.squeeze(0), f'{output_dir}/{fmt_name}_{ch_name}_pred.png')
 
             diff = (p - r).abs()
             if diff.shape[1] > 1:

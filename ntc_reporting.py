@@ -69,13 +69,12 @@ def _summarize_eval_results(all_results):
 
 
 def _write_eval_done(mode, ckpt_dir, config_path, bc_format_name,
-                     num_workers, all_results):
+                     all_results):
     done_data = _summarize_eval_results(all_results)
     done_data.update({
         'mode': mode,
         'config': config_path,
         'bc_format': bc_format_name,
-        'num_workers': num_workers,
     })
     write_done_json("eval", ckpt_dir, done_data)
 

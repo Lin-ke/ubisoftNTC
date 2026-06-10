@@ -2,7 +2,6 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import math
-from dataset import build_mipmaps
 
 def sample_lod_vaidyanathan(num_mips, device, max_useful_lod=None):
     """LOD 采样: 整数部分 ~ 指数 (∝ 4^(-k) 面积权重), 小数部分 ~ U[0,1).

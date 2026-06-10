@@ -16,10 +16,8 @@ def _vis_psnr(pred, ref):
     return -10 * np.log10(max(mse, 1e-10))
 
 
-def _tensor_to_hwc(tensor, is_normal=False):
+def _tensor_to_hwc(tensor):
     img = tensor.detach().cpu().permute(1, 2, 0).numpy()
-    if is_normal:
-        img = (img + 1.0) / 2.0
     return np.clip(img, 0, 1)
 
 
@@ -56,9 +54,8 @@ _CHANNEL_SPECS = {
     'Albedo': {
         'pred': (0, 3), 'ref': (0, 3), 'color': (0.8, 0.2, 0.2),
     },
-    # 模型只需要推理 normal.xy，z 在可视化/评估时由 xy 重建。
     'Normal': {
-        'pred': (3, 5), 'ref': (3, 6), 'color': (0.2, 0.6, 0.8), 'normal': True,
+        'pred': (3, 5), 'ref': (3, 6), 'color': (0.2, 0.6, 0.8),
     },
     'AO': {
         'pred': (6, 7), 'ref': (6, 7), 'color': (0.6, 0.6, 0.6),
@@ -73,12 +70,12 @@ _CHANNEL_SPECS = {
 _CHANNEL_ORDER = ['Albedo', 'Normal', 'AO', 'Roughness', 'Metalness']
 _COMPACT_CHANNEL_SPECS = {
     'Albedo': {'pred': (0, 3), 'ref': (0, 3), 'color': (0.8, 0.2, 0.2)},
-    'Normal': {'pred': (3, 5), 'ref': (3, 5), 'color': (0.2, 0.6, 0.8), 'normal': True},
+    'Normal': {'pred': (3, 5), 'ref': (3, 5), 'color': (0.2, 0.6, 0.8)},
     'AO':     {'pred': (5, 6), 'ref': (5, 6), 'color': (0.6, 0.6, 0.6)},
 }
 _CHANNEL_ALIASES = {
     'albedo': 'Albedo', 'basecolor': 'Albedo', 'base_color': 'Albedo',
-    'normal': 'Normal', 'normal_xy': 'Normal', 'normalxy': 'Normal',
+    'normal': 'Normal', 'normalxy': 'Normal',
     'ao': 'AO', 'occlusion': 'AO',
     'rough': 'Roughness', 'roughness': 'Roughness',
     'metal': 'Metalness', 'metallic': 'Metalness', 'metalness': 'Metalness',
@@ -163,8 +160,8 @@ def visualize_comparison(model, material_data, device, output_path, scale=0.0):
         rlo, rhi = spec['ref']
         pred_ch = pred[0, plo:phi]
         if label == 'Normal':
-            z = torch.sqrt(torch.clamp(1.0 - pred_ch[0:1] ** 2 - pred_ch[1:2] ** 2, min=0))
-            pred_ch = torch.cat([pred_ch, z], dim=0)
+            from ntc_utils import reconstruct_normal
+            pred_ch = reconstruct_normal(pred_ch.unsqueeze(0)).squeeze(0)
         return pred_ch, ref_tensor[rlo:rhi]
 
     rows = []
@@ -172,8 +169,8 @@ def visualize_comparison(model, material_data, device, output_path, scale=0.0):
     for label in channels:
         pred_ch, ref_ch = _pred_ref_for(label)
         psnr = _vis_psnr(pred_ch.unsqueeze(0), ref_ch.unsqueeze(0))
-        pred_np = _to_rgb(_tensor_to_hwc(pred_ch, is_normal=(label == 'Normal')))
-        ref_np = _to_rgb(_tensor_to_hwc(ref_ch, is_normal=(label == 'Normal')))
+        pred_np = _to_rgb(_tensor_to_hwc(pred_ch))
+        ref_np = _to_rgb(_tensor_to_hwc(ref_ch))
         diff = np.abs(pred_np - ref_np)
 
         panels = [pred_np, ref_np, diff]

@@ -8,6 +8,7 @@
 
     dataset:
       root: dataset
+      srgb_decode: true           # 是否将 PNG sRGB 解码到线性空间
 
     model:
       encoding: pyramid            # pyramid | hash_grid (legacy: mipmap)
@@ -26,6 +27,7 @@
     uc_training:                  # 训练无约束基线模型 (只在 --train-uc 时使用)
       total_iterations: 10000
       batch_res: 128
+      uv_sampling: tile           # tile | uniform (论文512x512铺满全域)
       lr_feat: 5.0e-2
       lr_mlp: 1.0e-3
       gamma: 0.9995
@@ -33,6 +35,7 @@
     bc_training:                  # BC QAT 阶段
       total_iterations: 10000
       batch_res: 128
+      uv_sampling: tile           # tile | uniform
       lr_feat: 1.0e-2
       lr_mlp: 1.0e-3
       betas: [0.9, 0.999]
@@ -182,9 +185,13 @@ def get_uc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
     if 'uc_training' not in config:
         raise ValueError("配置缺少 'uc_training' 段")
     t = config['uc_training']
+    uv_sampling = t.get('uv_sampling', 'tile')
+    if uv_sampling not in ('tile', 'uniform'):
+        raise ValueError(f"uv_sampling 仅支持 'tile' | 'uniform', 当前: '{uv_sampling}'")
     return {
         'total_iterations': t['total_iterations'],
         'batch_res': t['batch_res'],
+        'uv_sampling': uv_sampling,
         'lr_feat': t.get('lr_feat', 5.0e-2),
         'lr_mlp': t.get('lr_mlp', 1.0e-3),
         'gamma': t.get('gamma', 0.9995),
@@ -198,9 +205,13 @@ def get_bc_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
     t = config['bc_training']
     q = dict(_DEFAULT_HASH_GRID_QUANT)
     q.update(t.get('hash_grid_quant') or {})
+    uv_sampling = t.get('uv_sampling', 'tile')
+    if uv_sampling not in ('tile', 'uniform'):
+        raise ValueError(f"uv_sampling 仅支持 'tile' | 'uniform', 当前: '{uv_sampling}'")
     return {
         'total_iterations': t['total_iterations'],
         'batch_res': t['batch_res'],
+        'uv_sampling': uv_sampling,
         'lr_feat': t.get('lr_feat', 1.0e-2),
         'lr_mlp': t.get('lr_mlp', 1.0e-3),
         'betas': t.get('betas', [0.9, 0.999]),
@@ -218,18 +229,38 @@ def get_dataset_params(config: Dict[str, Any]) -> Dict[str, Any]:
     return {
         'root': d.get('root', 'dataset'),
         'output_channels': d.get('output_channels', 'full'),
+        'srgb_decode': d.get('srgb_decode', True),
     }
 
 
 def get_bc_mlp_training_params(config: Dict[str, Any]) -> Dict[str, Any]:
     t = config.get('bc_mlp_training', config.get('bc_training', {}))
+    uv_sampling = t.get('uv_sampling', 'tile')
     return {
         'total_iterations': t.get('total_iterations', 1000),
         'batch_res': t.get('batch_res', 128),
+        'uv_sampling': uv_sampling,
         'lr_mlp': t.get('lr_mlp', 1.0e-3),
         'betas': t.get('betas', [0.9, 0.999]),
         'loss_fn': config.get('loss', 'l1'),
     }
+
+
+def get_batch_materials(config: Dict[str, Any]) -> int:
+    """批量训练分组大小.
+
+    返回值含义:
+        0  → 一次性把所有材质放进一个 batch (M=全部).
+        N>0 → 按每组 N 个材质分批训练.
+    缺省 (配置无该键) → 0 (全部一组), 即默认启用 batched 训练.
+    """
+    val = config.get('batch_materials', 0)
+    if val is None:
+        return 0
+    val = int(val)
+    if val < 0:
+        raise ValueError("batch_materials 必须 >= 0 (0 表示全部材质一组)")
+    return val
 
 
 def get_benchmark_params(config: Dict[str, Any]) -> Dict[str, Any]:

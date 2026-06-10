@@ -1,0 +1,40 @@
+# Smoke test with BC=1000 for concurrency benchmark
+bc_format: bc1
+loss: l1
+
+model:
+  filter: trilinear
+  num_layers: 1
+  half_pixel_offsets: [1]
+  feature_configs:
+    - [64, 4, 3]
+    - [32, 3, 3]
+  hidden_dim: 8
+
+uc_training:
+  total_iterations: 100
+  batch_res: 32
+  lr_feat: 5.0e-2
+  lr_mlp: 1.0e-3
+  gamma: 0.9995
+
+bc_training:
+  total_iterations: 1000
+  batch_res: 32
+  lr_feat: 1.0e-2
+  lr_mlp: 1.0e-3
+  betas: [0.9, 0.999]
+
+bc_mlp_training:
+  total_iterations: 100
+  batch_res: 32
+  lr_mlp: 1.0e-3
+  betas: [0.9, 0.999]
+
+dataset:
+  root: dataset/dataset
+
+benchmark:
+  warmup_iters: 1
+  timing_iters: 1
+  mlp_param_bits: 16

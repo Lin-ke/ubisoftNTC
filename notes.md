@@ -195,3 +195,16 @@ Compression后应该做QAT，以解决压缩目标（重建参数图）和解压
 - pipeline OK, 38s total for 20 materials (single worker)
 - consistent with v3 (psnr_bc=5.56, drop=14.54), slightly worse but within noise
 - next: 启动 bc1_bcf05k 完整基线 (UC=5k, BC=200k, BC-MLP=1k, 2workers)
+
+---
+## [batched ensemble 训练] 单进程多材质堆叠 (替代多流/多进程并行)
+- 动机: 原训练 batch=1 (uv [1,H,W,2]), kernel 太小 -> GPU 利用率 3-5%, 多线程被 GIL 锁死, 多流在同 GPU 上仍串行.
+- 方案: M 个同构材质堆到 leading 维 M, 一次大 kernel 完成. grid_sample 原生支持 batch 维; MLP 用 bmm 批量线性.
+- 新增 ntc_batch_model.py: BatchedNeuralTextureModel / BatchedNeuralBCTextureModel + init_from_uc_batched + export_per_material_state_dicts.
+- 硬性前提: 每 iteration 共享同一连续 LOD scale (UV tile 仍各自随机), 否则不同 mip 分辨率无法堆进一个 grid_sample.
+- loss = Σ_m mean(per-material tile loss): 各材质参数互相独立, 该写法使每材质梯度与单独训练完全一致 (避免 1/M 缩放等效降 lr).
+- 训练后拆回标准单材质 .pth (uc/ bc_<fmt>/ bc_<fmt>_mlp/), eval/inference/compare 零改动复用.
+- 配置: 顶层 batch_materials (0=全部一组, N>0=每组N个); 默认对 pyramid+非resume 启用; hash_grid / resume 仍走原路径.
+- 数值验证: batched slice vs 标准模型 forward max_err ~1e-8 (UC/BC). smoke (3材质,20iter) 全流程 UC->BC->MLP->eval 通过, checkpoint 布局/兼容性 OK, 分组(含M=1尾组)OK.
+- VRAM: M=20 时全分辨率 GT mip0 堆叠约 3GB + 各级 ~4GB; 显存不足时调小 batch_materials.
+- 待办: 跑 bc1_bcf05k 完整 M=20 实测 wall-time 与 psnr_drop, 对比单材质基线确认共享LOD不退化.
